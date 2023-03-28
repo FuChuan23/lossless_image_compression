@@ -1,0 +1,151 @@
+import torch.utils.data as data
+from os import listdir
+from os.path import join
+import pickle
+
+from torch.utils.data import Dataset
+from PIL import Image
+import os
+from glob import glob
+from torchvision import transforms
+from torch.utils.data.dataset import Dataset
+
+import torch
+
+def is_image_file(filename):
+    return any(filename.endswith(extension) for extension in [".png", ".jpg", ".jpeg", ".JPEG"])
+
+def load_img(filepath,channel=1):
+    if channel==3:
+        img = Image.open(filepath).convert('RGB')
+    else:
+        img = Image.open(filepath)
+        # print(1111111,image.size())
+    return img
+
+class DatasetFromFolder(data.Dataset):
+    def __init__(self, image_dir, input_transform=None, cache=True, channel=3):
+        super(DatasetFromFolder, self).__init__()
+        self.image_filenames = [join(image_dir, x) for x in listdir(image_dir) if is_image_file(x)]
+        self.image_filenames.sort()
+
+        self.input_transform = input_transform
+        self.cache = cache
+        if cache :
+            self.image_list = []
+            for image_file in self.image_filenames:
+                self.image_list.append(load_img(image_file, channel))
+            print('load image finished')
+
+    def __getitem__(self, index):
+        if not self.cache:
+            input = load_img(self.image_filenames[index])
+        else:
+            input = self.image_list[index]
+        if self.input_transform:
+            input = self.input_transform(input)
+        return input, self.image_filenames[index]
+
+    def __len__(self):
+        return len(self.image_list) if self.cache else len(self.image_filenames)
+
+
+
+
+
+class Datasets(Dataset):
+    def __init__(self, data_dir, image_size=256, channel=3, crop=0, traininf=1):
+        self.data_dir = data_dir
+        self.image_size = image_size
+        self.channel = channel
+        self.crop = crop
+        self.traininf = traininf
+        if not os.path.exists(data_dir):
+            raise Exception(f"[!] {self.data_dir} not exitd")
+
+        self.image_path = sorted(glob(os.path.join(self.data_dir, "*.*")))
+
+    def __getitem__(self, item):
+        image_ori = self.image_path[item]
+        # image = Image.open(image_ori).convert('RGB')
+        if self.channel==1:
+            image = Image.open(image_ori)
+        else:
+            image = Image.open(image_ori).convert('RGB')
+        if self.traininf==1:
+            if self.crop==0:
+                transform = transforms.Compose([
+
+                    transforms.RandomHorizontalFlip(0.5),
+                    transforms.RandomVerticalFlip(0.5),
+                    transforms.ToTensor(),
+                    # transforms.Normalize((5, 0.5, 0.5), (0.5, 0.5, 0.5))
+                ])
+            else:
+                transform= transforms.Compose([
+                    transforms.RandomRotation(30),
+                    transforms.RandomCrop(256),
+                    # transforms.RandomResizedCrop(self.image_size, scale=(1, 1), ratio=(1, 1)),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.RandomVerticalFlip(),
+                    transforms.ToTensor(),
+                    # transforms.Normalize((5, 0.5, 0.5), (0.5, 0.5, 0.5))
+                ])
+        else:
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                # transforms.Normalize((5, 0.5, 0.5), (0.5, 0.5, 0.5))
+            ])
+
+        return transform(image)
+
+    def __len__(self):
+        return len(self.image_path)
+
+
+def get_loader(train_data_dir, test_data_dir, image_size, batch_size):
+    train_dataset = Datasets(train_data_dir, image_size)
+    test_dataset = Datasets(test_data_dir, image_size)
+
+    train_loader = torch.utils.data.DataLoader(dataset=train_dataset,
+                                               batch_size=batch_size,
+                                               shuffle=True)
+    test_loader = torch.utils.data.DataLoader(dataset=test_dataset,
+                                              batch_size=batch_size,
+                                              shuffle=False)
+    return train_loader, test_loader
+
+
+def get_train_loader(train_data_dir, image_size, batch_size):
+    train_dataset = Datasets(train_data_dir, image_size)
+    torch.manual_seed(3334)
+    train_loader = torch.utils.data.DataLoader(dataset=train_dataset,
+                                               batch_size=batch_size,
+                                               shuffle=True,
+                                               pin_memory=True)
+    return train_dataset, train_loader
+
+
+class TestKodakDataset(Dataset):
+    def __init__(self, data_dir,channel=3):
+        self.data_dir = data_dir
+        if not os.path.exists(data_dir):
+            raise Exception(f"[!] {self.data_dir} not exitd")
+        self.image_path = sorted(glob(os.path.join(self.data_dir, "*.*")))
+        self.channel = channel
+
+    def __getitem__(self, item):
+        image_ori = self.image_path[item]
+        if self.channel==1:
+            image = Image.open(image_ori)
+        else:
+            image = Image.open(image_ori).convert('RGB')
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+        return transform(image)
+
+    def __len__(self):
+        return len(self.image_path)
+
+
