@@ -1,0 +1,473 @@
+import argparse
+from module import *
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import logging
+from dataset import Datasets, TestKodakDataset
+from tensorboardX import SummaryWriter
+import numpy as np
+import os
+import datetime
+import shutil
+import AE
+import struct
+import torch.nn.functional as F
+best_bpp = 100
+import time
+from PIL import Image
+
+# CUDA_VISIBLE_DEVICES=0 python train.py --train ../data/flicker/ --val "../data/normal_image/Koada image/"
+from torchvision.transforms import RandomCrop, RandomHorizontalFlip, RandomVerticalFlip, Compose, ToTensor
+
+
+def adjust_learning_rate(optimizer, epoch, init_lr):
+    """Sets the learning rate to the initial LR decayed by 2 every 3 epochs"""
+    if epoch < 10:
+        lr = init_lr
+    else:
+        lr = init_lr * (0.5 ** ((epoch - 7) // 3))
+    if lr < 1e-6:
+        lr = 1e-6
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    return lr
+
+
+def checkpoint(epoch, model_prefix='checkpoint/', myfilename=None):
+    if not os.path.exists(model_prefix):
+        os.mkdir(model_prefix)
+    # model_out_path = os.path.join( model_prefix , "model_epoch_{}.pth".format(epoch) )
+    model_out_path = model_prefix + myfilename + "model_epoch_" + str(epoch) + ".pth"
+
+    if isinstance(Image_compression, torch.nn.DataParallel):
+        state = {'Image_compression': net.module,
+                 }
+    else:
+        state = {'Image_compression': net,
+                 }
+    torch.save(state, model_out_path)
+
+
+def restore(model_pretrained):
+    state = torch.load(model_pretrained, map_location=torch.device('cpu'))
+    net.load_state_dict(state['Image_compression'].state_dict())
+
+
+
+
+def get_logger(filename, verbosity=1, name=None):
+    level_dict = {0: logging.DEBUG, 1: logging.INFO, 2: logging.WARNING}
+    formatter = logging.Formatter(
+        "[%(asctime)s][%(filename)s][line:%(lineno)d][%(levelname)s] %(message)s"
+    )
+    logger = logging.getLogger(name)
+    logger.setLevel(level_dict[verbosity])
+
+    fh = logging.FileHandler(filename, "w")
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+
+    sh = logging.StreamHandler()
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
+
+    return logger
+
+
+def train(epochs, test_loaders, train_loader):
+    loggers.info("Epoch {} begin ".format(epochs))
+    global global_step, stage
+    global test_dataset, yuv
+    bpp_100 = 0
+    bpp_y_100 = 0
+    bpp_v_100 = 0
+    bpp_u_100 = 0
+    bpp_im_100 = 0
+    mse_100 = 0
+    loss_100 = 0
+    count_num = 0
+    global best_bpp, best_rd
+    device = next(net.parameters()).device
+    for batch_idx, inputs in enumerate(train_loader):
+        lens = len(train_loader)
+        batch_idx = (batch_idx + 1) / lens
+        global_step = global_step + 1
+        count_num += 1
+        net.train()
+        inputs = inputs.to(device)
+        def clip_gradient(optimizers, grad_clip):
+            for group in optimizers.param_groups:
+                for param in group["params"]:
+                    if param.grad is not None:
+                        param.grad.data.clamp_(-grad_clip, grad_clip)
+
+        bpp_im, bpp_y, bpp_u, bpp_v, mse = net(inputs, stage, args.yuv_transform)
+        if stage == 0:
+            loss = bpp_y + bpp_u + bpp_v
+            opt_s0.zero_grad()
+            loss.backward()
+            clip_gradient(opt_s0, 2.0)
+            opt_s0.step()
+            sch_s0.step()
+        else:
+            if args.im_context ==1:
+                loss = bpp_y + bpp_u + bpp_v + bpp_im + 256*256*0.01*mse
+            else:
+                loss = bpp_y + bpp_u + bpp_v
+            opt_s1.zero_grad()
+            loss.backward()
+            clip_gradient(opt_s1, 2)
+            opt_s1.step()
+            sch_s1.step()
+        if args.im_context ==1:
+            bpp_100 += (bpp_im + bpp_v + bpp_u + bpp_y).item()
+        else:
+            bpp_100 += (bpp_v + bpp_u + bpp_y).item()
+
+        bpp_y_100 += bpp_y.item()
+        bpp_u_100 += bpp_u.item()
+        bpp_v_100 += bpp_v.item()
+        if args.im_context == 1:
+            bpp_im_100 += bpp_im.item()
+            mse_100 += mse.item()
+        loss_100 += loss.item()
+        if global_step % args.print_freq == 0:
+            bpp_100 /= count_num
+            bpp_y_100 /= count_num
+            bpp_u_100 /= count_num
+            bpp_v_100 /= count_num
+            bpp_im_100 /= count_num
+            mse_100 /= count_num
+            loss_100 /= count_num
+            loggers.info(
+                "train on " + train_data + "ep:[{:}], gs:{:},step{:.3f},bpp:{:.3f},y:{:.2f}, u:{:.2f},v:{:.2f},"
+                                           "im{:.2f}, mse:{:.2f}, loss:{:.2f}"
+                .format(epochs, global_step, batch_idx, bpp_100, bpp_y_100, bpp_u_100,
+                        bpp_v_100, bpp_im_100, mse_100, loss_100))
+            bpp_100 = 0
+            bpp_y_100 = 0
+            bpp_u_100 = 0
+            bpp_v_100 = 0
+            mse_100 = 0
+            loss_100 = 0
+            count_num = 0
+        if (global_step % args.test_step) == 0:
+            Bpp, mse = testKodak(test_loaders)
+            net.train()
+            if Bpp < best_bpp:
+                best_bpp = Bpp
+                is_best = True
+            else:
+                is_best = False
+            
+    return 0
+
+
+def testKodak(test_loaders):
+    global global_step
+    global stage, best_bpp
+    with torch.no_grad():
+        net.eval()
+        sum_bpp = 0
+        sum_bpp_y = 0
+        sum_bpp_u = 0
+        sum_bpp_v = 0
+        sum_bpp_img = 0
+        sum_mse = 0
+        count = 0
+        patch_size = 256
+        if args.val == '../data/imagenet64/valid_64x64':
+            patch_size=64
+        device = next(net.parameters()).device
+        for idx, d in enumerate(test_loaders):
+
+            # if idx>=1:
+            #     continue
+            count += 1
+            b, c, h, w = d.size()
+            H = (h // patch_size) * patch_size
+            W = (w // patch_size) * patch_size
+            if H < h:
+                H += patch_size
+            if W < w:
+                W += patch_size
+            pad_up = (H - h) // 2
+            pad_down = (H - h) - pad_up
+            pad_left = (W - w) // 2
+            pad_right = (W - w) - pad_left
+            x = torch.tensor(np.pad(d, [[0, 0], [0, 0], [pad_up, pad_down], [pad_left, pad_right]]))
+            
+            # print(temp_Y.size())
+            t_h = round(H / patch_size)
+            t_w = round(W / patch_size)
+            bpp_loss_single = 0
+            mse_loss_single = 0
+            bpp_y_single = 0
+            bpp_v_single = 0
+            bpp_u_single = 0
+            bpp_img_single = 0
+            t_count_num = 0
+            for tt_h in range(t_h):
+                for tt_w in range(t_w):
+                    temp_batch = x[:, :, tt_h * patch_size:(tt_h + 1) * patch_size,
+                                 tt_w * patch_size:(tt_w + 1) * patch_size]
+                    temp_batch = temp_batch.to(device)
+                    bpp_im, bpp_y, bpp_u, bpp_v, mse = net(temp_batch, stage, args.yuv_transform)
+                   
+                   if args.im_context ==1:
+                        bpp_loss_single += (bpp_y + bpp_v + bpp_u + bpp_im)
+                        bpp_img_single += bpp_im
+                    else:
+                        bpp_loss_single += (bpp_y + bpp_v + bpp_u)
+
+                    bpp_y_single += bpp_y
+                    bpp_v_single += bpp_v
+                    bpp_u_single += bpp_u
+
+                    t_count_num += 1
+
+            bpp_loss_single = bpp_loss_single * patch_size * patch_size / w / h
+            bpp_y_single = bpp_y_single * patch_size * patch_size / w / h
+            bpp_v_single = bpp_v_single * patch_size * patch_size / w / h
+            bpp_u_single = bpp_u_single * patch_size * patch_size / w / h
+            if args.im_context ==1:
+                bpp_img_single = bpp_img_single * patch_size * patch_size / w / h
+            if args.val == '../data/imagenet64/valid_64x64':
+                if idx % 1000 ==0:
+                    loggers.info(val_data + "ep:[{:}],idx{:},bpp:{:.3f},y:{:.2f}, u:{:.2f},v:{:.2f},"
+                                            "im{:.2f}, mse:{:.3f}"
+                                 .format(epoch, idx, bpp_loss_single, bpp_y_single, bpp_u_single,
+                                         bpp_v_single, bpp_img_single, mse_loss_single))
+            else:
+                loggers.info(val_data + "ep:[{:}],idx{:},bpp:{:.3f},y:{:.2f}, u:{:.2f},v:{:.2f},"
+                                        "im{:.2f}, mse:{:.3f}"
+                             .format(epoch, idx, bpp_loss_single, bpp_y_single, bpp_u_single,
+                                     bpp_v_single, bpp_img_single, mse_loss_single))
+            sum_bpp += bpp_loss_single
+            sum_bpp_y += bpp_y_single
+            sum_bpp_u += bpp_u_single
+            sum_bpp_v += bpp_v_single
+            sum_bpp_img += bpp_img_single
+        sum_bpp /= count
+        sum_bpp_y /= count
+        sum_bpp_u /= count
+        sum_bpp_v /= count
+        sum_bpp_img /= count
+        # sum_mse /= count
+        loggers.info("bestbpp:{:} [epoch:{:}, bpp:{:.3f},y:{:.3f},u:{:.3f},v:{:.3f}, im:{:.3f}, mse:{:.3f}".
+                     format(best_bpp, epoch, sum_bpp, sum_bpp_y, sum_bpp_u, sum_bpp_v, sum_bpp_img, sum_mse))
+        #       
+        return sum_bpp, sum_mse
+
+
+def img_pad(img, shape_num):
+    """Padding image based on the shape number multiples."""
+    assert len(img.shape) == 4
+    _, _, ht, wt = img.shape
+    ht_res = (shape_num - ht % shape_num) % shape_num
+    wt_res = (shape_num - wt % shape_num) % shape_num
+    pad_u = ht_res // 2
+    pad_d = ht_res - pad_u
+    pad_l = wt_res // 2
+    pad_r = wt_res - pad_l
+    padding = (pad_l, pad_r, pad_u, pad_d)
+    img = F.pad(img, padding, 'replicate')
+    return img
+
+
+
+if __name__ == "__main__":
+    torch.backends.cudnn.enabled = True
+    gpu_num = torch.cuda.device_count()
+    os.environ['CUDA_VISIBLE_DEVICE'] = '0,1,2,3,4,5,6,7'
+    torch.set_num_threads(4)
+
+    best_rd = 1000000
+    best_bpp = 1000
+
+    parser = argparse.ArgumentParser(description='Pytorch reimplement for variational image compression with a scale '                                               'hyperprior')
+    parser.add_argument(
+        "--checkpoint_dir", default="./checkpoints/",
+        help="Directory where to save/load model checkpoints.")
+    parser.add_argument(
+        "--batchsize", type=int, default=1,
+        help="Batch size for training.")
+    parser.add_argument(
+        "--patchsize", type=int, default=256,
+        help="Size of image patches for training.")
+    parser.add_argument(
+        "--stage", type=int, default=1,
+        help="stage number.")
+    parser.add_argument(
+        "--test_step", type=int, default=2000,
+        help="test_step")
+    parser.add_argument(
+        "--print_freq", type=int, default=200,
+        help="print_freq")
+    parser.add_argument(
+        "--save_freq", type=int, default=200000,
+        help="print_freq")
+
+    parser.add_argument(
+        "--epoch", type=int, default=200,
+        help="epoch number.")
+    parser.add_argument(
+        "--yuv_transform", type=int, default=1,
+        help="epoch number.")
+    # glcontext = 1, gmm = 1, kernal = 3, model = 1, context_ch = 32, att = 0, lost = 0,
+    # model1 = 0, model2 = 0, model3 = 0, model4 = 0, model5 = 0)
+    parser.add_argument(
+        "--kernal", type=int, default=3,
+        help="kernal size, if kernal==1 means mixture context, if kernal==0 means no context")
+    parser.add_argument(
+        "--model", type=int, default=1,
+        help="probablity model type, 6 means mixture")
+    parser.add_argument(
+        "--N", type=int, default=128,
+        help="channel.")
+    parser.add_argument(
+        "--gmm", type=int, default=3, help="GMM:1 mean single model ")
+    parser.add_argument(
+        "--mix", type=int, default=7, help="mixture model key word, 7 means 7 mixture model")
+    parser.add_argument(
+        "--model1", type=int, default=0, help="entropy model1 ")
+    parser.add_argument(
+        "--model2", type=int, default=0, help="entropy model2 ")
+    parser.add_argument(
+        "--model3", type=int, default=0, help="entropy model3")
+    parser.add_argument(
+        "--model4", type=int, default=0, help="entropy model4")
+    parser.add_argument(
+        "--model5", type=int, default=0, help="entropy model5 ")
+    parser.add_argument(
+        "--model6", type=int, default=0, help="entropy model6")
+    parser.add_argument(
+        "--model7", type=int, default=0, help="entropy model7 ")
+    parser.add_argument(
+        "--context_ch", type=int, default=32, help="context chennel number")
+    parser.add_argument(
+        "--att", type=int, default=0, help="att model")
+    parser.add_argument(
+        "--y_train", type=int, default=1, help="att model")
+    parser.add_argument(
+        "--rfy", type=int, default=0, help="only refine y")
+    parser.add_argument(
+        "--k_global_ex", type=int, default=3, help="only refine y")
+    parser.add_argument(
+        "--im_context", type=int, default=1, help="if with context Y")
+    parser.add_argument(
+        "--lambda", type=float, default=8192, dest="lmbda",
+        help="Lambda for rate-distortion tradeoff.")
+    parser.add_argument('--test', action='store_true')
+    parser.add_argument('-n', '--name', default='', help='experiment name')
+    parser.add_argument('--train', dest='train', default='../data/DIV2K_train_HR_256/',
+                        help='the path of training dataset')
+    parser.add_argument('--val', dest='val', default='../data/normal_image/Koada image',
+                        help='the path of validation dataset')
+    parser.add_argument('--seed', default=234, type=int, help='seed for random functions, and network initialization')
+    parser.add_argument(
+        "--load_weights", default="",
+        help="Loaded weights")
+    parser.add_argument(
+        "--lr",
+        default=1e-4,
+        type=float,
+        help="Learning rate (default: %(default)s)",
+    )
+
+    args = parser.parse_args()
+    if args.val == '../data/mobile_test/valid':
+        val_data = 'mobile_v'
+        vals = "CLIC_mobile"
+    elif args.val == '../data/professional_test/valid':
+        val_data = 'professional_v'
+        vals = "CLIC_professional"
+    elif args.val == '../data/DIV2K_valid_HR/DIV2K_valid_HR':
+        val_data = 'div2k_'
+        vals = "DIV2K_valid"
+    elif args.val == '../data/normal_image/Koada image/':
+        val_data = 'koada_'
+        vals = "Koada"
+    elif args.val == '../data/imagenet64/valid_64x64':
+        val_data = 'imagenet64_'
+        vals = "imagenet64"
+   
+
+    
+    if args.train == '../data/Flickr2K_256/':
+        train_data = 'flicker2k_'
+    elif args.train == '../data/imagenet64/train_64x64/':
+        train_data = 'imagenet64_'
+    
+    today = datetime.date.today()
+    todaytime = today.strftime('%y%m%d')
+
+    torch.manual_seed(seed=args.seed)
+    if args.yuv_transform == 1:
+        yuv = 1
+    else:
+        yuv = 0
+
+    tb_logger = None
+    save_path = os.path.join('checkpoints', args.name)
+
+    net = Image_compression(N=args.N, gmm=args.gmm, kernal=args.kernal, model=args.model, context_ch=args.context_ch,
+                            att=args.att, kg=args.k_global_ex, im_context=args.im_context)
+
+    assert k==1
+
+    loggers = get_logger(os.path.join("./loger_" + str(todaytime) + 'k_' + str(args.kernal) + '_g_' + str(args.gmm) + '_m_'
+        + str(args.model) + '_a_' + str(args.att) + '_l_' + str(args.mix) + '_c_'
+        + str(args.context_ch) + "_train_" + str(args.y_train) + train_data +
+        '_' + val_data + "_lr_" + str(args.lr) + "_bt_" + str(args.batchsize) + "_N_" + str(args.N) + '_yuv_'
+        + str(yuv) + '_s_' + str(args.stage) + str(args.rfy) + '_kg' + str(args.k_global_ex) + "_imcontext_" +
+        str(args.im_context) + ".log"))
+    loggers.info("start training!" + str(todaytime))
+    loggers.info("image compression training")
+    net = net.cuda()
+    #
+    if args.val == '../data/imagenet64/valid_64x64':
+        test_batchsize = 1
+    else:
+        test_batchsize = 1
+
+    test_dataset = TestKodakDataset(data_dir=args.val)
+    test_loader = DataLoader(dataset=test_dataset, shuffle=False, batch_size=test_batchsize, pin_memory=True,
+                             num_workers=1)
+
+    tb_logger = SummaryWriter(os.path.join(save_path, 'events'))
+    train_data_dir = args.train
+    train_dataset = Datasets(train_data_dir, args.patchsize)
+    train_loader = DataLoader(dataset=train_dataset,
+                              batch_size=args.batchsize,
+                              shuffle=True,
+                              pin_memory=True,
+                              num_workers=8)
+
+    global_step = 0
+
+    for epoch in range(args.epoch):
+        stage = args.stage
+        torch.cuda.empty_cache()
+        
+        if global_step%200000:
+           file_names_check = args.checkpoint_dir + "/lossless_" + str(stage) + "_bs_" + str(args.batchsize) +
+                               train_data + val_data + "_lr_" + str(args.lr) + "_GK_" + 'k_' + str(
+                                   args.kernal) + '_g_' +
+                               str(args.gmm) + '_m_' + str(args.model) + '_a_' + str(args.att) + '_l_' + str(args.mix)
+                               + '_c_' + str(args.context_ch)
+                               + '_yuv_' + str(yuv)+"_train_"+str(args.y_train) +"_rfy_ "+str(args.rfy) +
+                               '_kg'+str(args.k_global_ex)+"_imcontext_"+ str(args.im_context) +str(global_step).ckpt"
+           checkpoint(epoch, net, file_names_check):
+
+
+
+        if args.stage==0:
+            opt_s0 = optim.Adam(net.stage0_params(), lr=args.lr)
+            sch_s0 = torch.optim.lr_scheduler.CosineAnnealingLR(opt_s0, 2000, eta_min=1e-8, last_epoch=-1)
+
+        opt_s1 = optim.Adam(net.parameters(), lr=args.lr)
+        sch_s1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt_s1, 2000, eta_min=1e-8, last_epoch=-1)
+
+        bpp = train(epoch, test_loader, train_loader)
