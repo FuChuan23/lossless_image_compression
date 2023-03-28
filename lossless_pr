@@ -1,0 +1,2115 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import math
+from torch.nn import Parameter
+from torch.distributions.uniform import Uniform
+from abc import ABC
+from typing import Tuple, Union
+from torch import Tensor
+from torch.distributions import uniform
+_LOG_SCALES_MIN = -7.
+_MAX_K_FOR_VIS = 10
+
+from collections import namedtuple
+
+import torch
+import torch.nn.functional as F
+# import scipy.stats
+import numpy as np
+
+SCALE_TABLE = np.linspace(np.log(0.1), np.log(256), 64)  # table 1
+
+
+YCBCR_WEIGHTS = {
+    # Spec: (K_r, K_g, K_b) with K_g = 1 - K_r - K_b
+    "ITU-R_BT.709": (0.2126, 0.7152, 0.0722)
+}
+
+
+def _check_input_tensor(tensor: Tensor) -> None:
+    if (
+        not isinstance(tensor, Tensor)
+        or not tensor.is_floating_point()
+        or not len(tensor.size()) in (3, 4)
+        or not tensor.size(-3) == 3
+    ):
+        raise ValueError(
+            "Expected a 3D or 4D tensor with shape (Nx3xHxW) or (3xHxW) as input"
+        )
+
+
+def rgb2ycbcr(rgb: Tensor) -> Tensor:
+    """RGB to YCbCr conversion for torch Tensor.
+    Using ITU-R BT.709 coefficients.
+
+    Args:
+        rgb (torch.Tensor): 3D or 4D floating point RGB tensor
+
+    Returns:
+        ycbcr (torch.Tensor): converted tensor
+    """
+    _check_input_tensor(rgb)
+
+    r, g, b = rgb.chunk(3, -3)
+    Kr, Kg, Kb = YCBCR_WEIGHTS["ITU-R_BT.709"]
+    y = Kr * r + Kg * g + Kb * b
+    cb = 0.5 * (b - y) / (1 - Kb) + 0.5
+    cr = 0.5 * (r - y) / (1 - Kr) + 0.5
+    ycbcr = torch.cat((y, cb, cr), dim=-3)
+    return ycbcr
+
+def rgb2ycbcr1(rgb: Tensor) -> Tensor:
+    """RGB to YCbCr conversion for torch Tensor.
+    Using ITU-R BT.709 coefficients.
+
+    Args:
+        rgb (torch.Tensor): 3D or 4D floating point RGB tensor
+
+    Returns:
+        ycbcr (torch.Tensor): converted tensor
+    """
+    _check_input_tensor(rgb)
+
+    r, g, b = rgb.chunk(3, -3)
+    # Kr, Kg, Kb = YCBCR_WEIGHTS["ITU-R_BT.709"]
+    y = torch.floor((r+2*g+b)/4)
+    # y = Kr * r + Kg * g + Kb * b
+    cb = b-g
+    cr = r-g
+    ycbcr = torch.cat((y, cb, cr), dim=-3)
+    return ycbcr
+
+
+def ycbcr2rgb1(ycbcr: Tensor) -> Tensor:
+    """YCbCr to RGB conversion for torch Tensor.
+    Using ITU-R BT.709 coefficients.
+
+    Args:
+        ycbcr (torch.Tensor): 3D or 4D floating point RGB tensor
+
+    Returns:
+        rgb (torch.Tensor): converted tensor
+    """
+    _check_input_tensor(ycbcr)
+
+    y, cb, cr = ycbcr.chunk(3, -3)
+    # Kr, Kg, Kb = YCBCR_WEIGHTS["ITU-R_BT.709"]
+    g = y - torch.floor(cr/4+cb/4)
+    r = cr+g
+    b = cb+g
+    rgb = torch.cat((r, g, b), dim=-3)
+    return rgb
+
+
+def ycbcr2rgb(ycbcr: Tensor) -> Tensor:
+    """YCbCr to RGB conversion for torch Tensor.
+    Using ITU-R BT.709 coefficients.
+
+    Args:
+        ycbcr (torch.Tensor): 3D or 4D floating point RGB tensor
+
+    Returns:
+        rgb (torch.Tensor): converted tensor
+    """
+    _check_input_tensor(ycbcr)
+
+    y, cb, cr = ycbcr.chunk(3, -3)
+    Kr, Kg, Kb = YCBCR_WEIGHTS["ITU-R_BT.709"]
+    r = y + (2 - 2 * Kr) * (cr - 0.5)
+    b = y + (2 - 2 * Kb) * (cb - 0.5)
+    g = (y - Kr * r - Kb * b) / Kg
+    rgb = torch.cat((r, g, b), dim=-3)
+    return rgb
+
+
+def yuv_444_to_420(
+    yuv: Union[Tensor, Tuple[Tensor, Tensor, Tensor]],
+    mode: str = "avg_pool",
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Convert a 444 tensor to a 420 representation.
+
+    Args:
+        yuv (torch.Tensor or (torch.Tensor, torch.Tensor, torch.Tensor)): 444
+            input to be downsampled. Takes either a (Nx3xHxW) tensor or a tuple
+            of 3 (Nx1xHxW) tensors.
+        mode (str): algorithm used for downsampling: ``'avg_pool'``. Default
+            ``'avg_pool'``
+
+    Returns:
+        (torch.Tensor, torch.Tensor, torch.Tensor): Converted 420
+    """
+    if mode not in ("avg_pool",):
+        raise ValueError(f'Invalid downsampling mode "{mode}".')
+
+    if mode == "avg_pool":
+
+        def _downsample(tensor):
+            return F.avg_pool2d(tensor, kernel_size=2, stride=2)
+
+    if isinstance(yuv, torch.Tensor):
+        y, u, v = yuv.chunk(3, 1)
+    else:
+        y, u, v = yuv
+
+    return (y, _downsample(u), _downsample(v))
+
+
+def yuv_420_to_444(
+    yuv: Tuple[Tensor, Tensor, Tensor],
+    mode: str = "bilinear",
+    return_tuple: bool = False,
+) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
+    """Convert a 420 input to a 444 representation.
+
+    Args:
+        yuv (torch.Tensor, torch.Tensor, torch.Tensor): 420 input frames in
+            (Nx1xHxW) format
+        mode (str): algorithm used for upsampling: ``'bilinear'`` |
+            ``'nearest'`` Default ``'bilinear'``
+        return_tuple (bool): return input as tuple of tensors instead of a
+            concatenated tensor, 3 (Nx1xHxW) tensors instead of one (Nx3xHxW)
+            tensor (default: False)
+
+    Returns:
+        (torch.Tensor or (torch.Tensor, torch.Tensor, torch.Tensor)): Converted
+            444
+    """
+    if len(yuv) != 3 or any(not isinstance(c, torch.Tensor) for c in yuv):
+        raise ValueError("Expected a tuple of 3 torch tensors")
+
+    if mode not in ("bilinear", "nearest"):
+        raise ValueError(f'Invalid upsampling mode "{mode}".')
+
+    if mode in ("bilinear", "nearest"):
+
+        def _upsample(tensor):
+            return F.interpolate(tensor, scale_factor=2, mode=mode, align_corners=False)
+
+    y, u, v = yuv
+    u, v = _upsample(u), _upsample(v)
+    if return_tuple:
+        return y, u, v
+    return torch.cat((y, u, v), dim=1)
+
+
+class RGB2YCbCr1:
+    """Convert a RGB tensor to YCbCr.
+    The tensor is expected to be in the [0, 1] floating point range, with a
+    shape of (3xHxW) or (Nx3xHxW).
+    """
+
+    def __call__(self, rgb):
+        """
+        Args:
+            rgb (torch.Tensor): 3D or 4D floating point RGB tensor
+
+        Returns:
+            ycbcr(torch.Tensor): converted tensor
+        """
+        return rgb2ycbcr(rgb)
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}()"
+
+
+class YCbCr2RGB1:
+    """Convert a YCbCr tensor to RGB.
+    The tensor is expected to be in the [0, 1] floating point range, with a
+    shape of (3xHxW) or (Nx3xHxW).
+    """
+
+    def __call__(self, ycbcr):
+        """
+        Args:
+            ycbcr(torch.Tensor): 3D or 4D floating point RGB tensor
+
+        Returns:
+            rgb(torch.Tensor): converted tensor
+        """
+        return ycbcr2rgb(ycbcr)
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}()"
+
+
+class RGB2YCbCr:
+    """Convert a RGB tensor to YCbCr.
+    The tensor is expected to be in the [0, 1] floating point range, with a
+    shape of (3xHxW) or (Nx3xHxW).
+    """
+
+    def __call__(self, rgb):
+        """
+        Args:
+            rgb (torch.Tensor): 3D or 4D floating point RGB tensor
+
+        Returns:
+            ycbcr(torch.Tensor): converted tensor
+        """
+        return rgb2ycbcr1(rgb)
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}()"
+
+
+class YCbCr2RGB:
+    """Convert a YCbCr tensor to RGB.
+    The tensor is expected to be in the [0, 1] floating point range, with a
+    shape of (3xHxW) or (Nx3xHxW).
+    """
+
+    def __call__(self, ycbcr):
+        """
+        Args:
+            ycbcr(torch.Tensor): 3D or 4D floating point RGB tensor
+
+        Returns:
+            rgb(torch.Tensor): converted tensor
+        """
+        return ycbcr2rgb1(ycbcr)
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}()"
+
+
+class YUV444To420:
+    """Convert a YUV 444 tensor to a 420 representation.
+
+    Args:
+        mode (str): algorithm used for downsampling: ``'avg_pool'``. Default
+            ``'avg_pool'``
+
+    Example:
+        >>> x = torch.rand(1, 3, 32, 32)
+        >>> y, u, v = YUV444To420()(x)
+        >>> y.size()  # 1, 1, 32, 32
+        >>> u.size()  # 1, 1, 16, 16
+    """
+
+    def __init__(self, mode: str = "avg_pool"):
+        self.mode = str(mode)
+
+    def __call__(self, yuv):
+        """
+        Args:
+            yuv (torch.Tensor or (torch.Tensor, torch.Tensor, torch.Tensor)):
+                444 input to be downsampled. Takes either a (Nx3xHxW) tensor or
+                a tuple of 3 (Nx1xHxW) tensors.
+
+        Returns:
+            (torch.Tensor, torch.Tensor, torch.Tensor): Converted 420
+        """
+        return yuv_444_to_420(yuv, mode=self.mode)
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}()"
+
+
+class YUV420To444:
+    """Convert a YUV 420 input to a 444 representation.
+
+    Args:
+        mode (str): algorithm used for upsampling: ``'bilinear'`` | ``'nearest'``.
+            Default ``'bilinear'``
+        return_tuple (bool): return input as tuple of tensors instead of a
+            concatenated tensor, 3 (Nx1xHxW) tensors instead of one (Nx3xHxW)
+            tensor (default: False)
+
+    Example:
+        >>> y = torch.rand(1, 1, 32, 32)
+        >>> u, v = torch.rand(1, 1, 16, 16), torch.rand(1, 1, 16, 16)
+        >>> x = YUV420To444()((y, u, v))
+        >>> x.size()  # 1, 3, 32, 32
+    """
+
+    def __init__(self, mode: str = "bilinear", return_tuple: bool = False):
+        self.mode = str(mode)
+        self.return_tuple = bool(return_tuple)
+
+    def __call__(self, yuv):
+        """
+        Args:
+            yuv (torch.Tensor, torch.Tensor, torch.Tensor): 420 input frames in
+                (Nx1xHxW) format
+
+        Returns:
+            (torch.Tensor or (torch.Tensor, torch.Tensor, torch.Tensor)): Converted
+                444
+        """
+        return yuv_420_to_444(yuv, return_tuple=self.return_tuple)
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(return_tuple={self.return_tuple})"
+
+def conv3x3(in_ch, out_ch, stride=1):
+    """3x3 convolution with padding."""
+    conv = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1)
+    return conv
+
+
+def subpel_conv3x3(in_ch, out_ch, r=1):
+    """3x3 sub-pixel convolution for up-sampling."""
+    conv = nn.Conv2d(in_ch, out_ch * r ** 2, kernel_size=3, padding=1)
+    return nn.Sequential(conv, nn.PixelShuffle(r))
+
+
+def conv1x1(in_ch, out_ch, stride=1):
+    """1x1 convolution."""
+    conv = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride)
+    return conv
+
+
+class AttentionBlock(nn.Module, ABC):
+    """Self attention block.
+
+    Simplified variant from `"Learned Image Compression with
+    Discretized Gaussian Mixture Likelihoods and Attention Modules"
+    <https://arxiv.org/abs/2001.01568>`_, by Zhengxue Cheng, Heming Sun, Masaru
+    Takeuchi, Jiro Katto.
+
+    Args:
+        N (int): Number of channels)
+    """
+
+    def __init__(self, N: int):
+        super().__init__()
+
+        class ResidualUnit(nn.Module):
+            """Simple residual unit."""
+
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Sequential(
+                    conv1x1(N, N // 2),
+                    nn.ReLU(inplace=True),
+                    conv3x3(N // 2, N // 2),
+                    nn.ReLU(inplace=True),
+                    conv1x1(N // 2, N),
+                )
+                self.relu = nn.ReLU(inplace=True)
+
+            def forward(self, x: Tensor) -> Tensor:
+                identity = x
+                out = self.conv(x)
+                out += identity
+                out = self.relu(out)
+                return out
+
+        self.conv_a = nn.Sequential(ResidualUnit(), ResidualUnit(), ResidualUnit())
+
+        self.conv_b = nn.Sequential(
+            ResidualUnit(),
+            ResidualUnit(),
+            ResidualUnit(),
+            conv1x1(N, N),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        identity = x
+        a = self.conv_a(x)
+        b = self.conv_b(x)
+        out = a * torch.sigmoid(b)
+        out += identity
+        return out
+
+
+class ResidualBlock(nn.Module, ABC):
+    """Simple residual block with two 3x3 convolutions.
+
+    Args:
+        in_ch (int): number of input channels
+        out_ch (int): number of output channels
+    """
+
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv1 = conv3x3(in_ch, out_ch)
+        self.leaky_relu = nn.LeakyReLU(inplace=True)
+        self.conv2 = conv3x3(out_ch, out_ch)
+        if in_ch != out_ch:
+            self.skip = conv1x1(in_ch, out_ch)
+        else:
+            self.skip = None
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.leaky_relu(out)
+        out = self.conv2(out)
+        out = self.leaky_relu(out)
+
+        if self.skip is not None:
+            identity = self.skip(x)
+
+        out = out + identity
+        return out
+
+def non_shared_get_Kp(K, C, num):
+    """ Get Kp=number of channels to predict. See note where we define _NUM_PARAMS_RGB above """
+    return num * C * K
+
+def non_shared_get_K(Kp, C, num):
+    """ Inverse of non_shared_get_Kp, get back K=number of mixtures """
+    return Kp // (num * C)
+
+# TODO: replace with pytorch internal in 1.0, there is a bug in 0.4.1
+def log_softmax(logit_probs, dim):
+    """ numerically stable log_softmax implementation that prevents overflow """
+    m, _ = torch.max(logit_probs, dim=dim, keepdim=True)
+    return logit_probs - m - torch.log(torch.sum(torch.exp(logit_probs - m), dim=dim, keepdim=True))
+
+
+def log_sum_exp(log_probs, dim):
+    """ numerically stable log_sum_exp implementation that prevents overflow """
+    m, _        = torch.max(log_probs, dim=dim)
+    m_keep, _   = torch.max(log_probs, dim=dim, keepdim=True)
+    # == m + torch.log(torch.sum(torch.exp(log_probs - m_keep), dim=dim))
+    return log_probs.sub_(m_keep).exp_().sum(dim=dim).log_().add(m)
+
+class DiscretizedMixDistribution1(torch.nn.Module):
+    t = 1.  # E[tX] = t*E[X], (Var[tX] = t^2*Var[X])
+
+    def __init__(self, rgb_scale=False, x_min=0, x_max=255, num_p=3, L=256):
+        """
+        :param rgb_scale: Whether this is the loss for the RGB scale. In that case,
+            use_coeffs=True
+            _num_params=_NUM_PARAMS_RGB == 4, since we predict coefficients lambda. See note above.
+        :param x_min: minimum value in targets x
+        :param x_max: maximum value in targets x
+        :param L: number of symbols
+        """
+        super(DiscretizedMixDistribution1, self).__init__()
+        self.rgb_scale = rgb_scale
+        self.x_min = x_min
+        self.x_max = x_max
+        self.L = L
+        # whether to use coefficients lambda to weight means depending on previously outputed means.
+        self.use_coeffs = rgb_scale
+        # P means number of different variables contained in l, l means output of network
+        self._num_params = num_p
+
+        # NOTE: in contrast to the original code, we use a sigmoid (instead of a tanh)
+        # The optimizer seems to not care, but it would probably be more principaled to use a tanh
+        # Compare with L55 here: https://github.com/openai/pixel-cnn/blob/master/pixel_cnn_pp/nn.py#L55
+        self._nonshared_coeffs_act = torch.sigmoid
+
+        # Adapted bounds for our case.
+        self.bin_width = (x_max - x_min) / (L - 1)
+        self.x_lower_bound = x_min + 0.001
+        self.x_upper_bound = x_max - 0.001
+
+        self._extra_repr = 'DMLL: x={}, L={}, coeffs={}, P={}, bin_width={}'.format(
+            (self.x_min, self.x_max), self.L, self.use_coeffs, self._num_params, self.bin_width)
+
+        self.built = False  # CDF table Flag
+
+    def extra_repr(self):
+        return self._extra_repr
+
+    @staticmethod
+    def to_per_pixel(entropy, C):
+        N, H, W = entropy.shape
+        return entropy.sum() / (N * C * H * W)  # NHW -> scalar
+
+    def forward(self, x, l, scale=0):
+        """
+        :param x: labels, i.e., NCHW, float
+        :param l: predicted distribution, i.e., NKpHW, see above
+        :return: log-likelihood, as NHW if shared, NCHW if non_shared pis
+        """
+        # print(x.max(),x.min())
+        assert x.min() >= self.x_min and x.max() <= self.x_max, '{},{} not in {},{}'.format(
+            x.min(), x.max(), self.x_min, self.x_max)
+
+        # Extract ---
+        #  NCKHW      NCKHW  NCKHW
+
+        # print(self._num_params,1111111111111111111111111)
+        # print(x.shape, l.shape,111111111111222222222222222222)
+        x, logit_pis, means, log_scales, K = self._extract_non_shared(x, l)
+
+        if K == 1:
+            # modified
+            means = means * self.t
+            # log_scales = log_scales + 2*np.log(self.t)
+
+            if (self._num_params > 1):
+                centered_x = x - means  # NCKHW
+            centered_x = centered_x.abs()  # modified
+
+            # Calc P = cdf_delta
+            # all of the following is NCKHW
+            inv_stdv = torch.exp(-log_scales)  # <= exp(7), is exp(-sigma), inverse std. deviation, i.e., sigma'
+            plus_in = inv_stdv * (- centered_x + self.bin_width / 2)  # sigma' * (x - mu + 0.5)  # modified
+            min_in = inv_stdv * (- centered_x - self.bin_width / 2)  # sigma' * (x - mu - 1/255)  # modified
+
+            # modified: Laplace distribution
+            cdf_plus = self._standardized_cumulative(plus_in)  # S(sigma' * (x - mu + 1/255))
+            cdf_min = self._standardized_cumulative(
+                min_in)  # S(sigma' * (x - mu - 1/255)) == 1 / (1 + exp(sigma' * (x - mu - 1/255))
+
+            # the following two follow from the definition of the logistic distribution
+            log_cdf_plus = plus_in - F.softplus(plus_in)  # log probability for edge case of 0
+            log_one_minus_cdf_min = -F.softplus(min_in)  # log probability for edge case of 255
+            # NCKHW, P^k(c)
+            cdf_delta = cdf_plus - cdf_min  # probability for all other cases, essentially log_cdf_plus + log_one_minus_cdf_min
+
+            # NOTE: the original code has another condition here:
+            #   tf.where(cdf_delta > 1e-5,
+            #            tf.log(tf.maximum(cdf_delta, 1e-12)),
+            #            log_pdf_mid - np.log(127.5)
+            #            )
+            # which handles the extremly low porbability case. Since this is only there to stabilize training,
+            # and we get fine training without it, I decided to drop it
+            #
+            # so, we have the following if, where I put in the x_upper_bound and x_lower_bound values for RGB
+            # if x < 0.001:                         cond_C
+            #       log_cdf_plus                    out_C
+            # elif x > 254.999:                     cond_B
+            #       log_one_minus_cdf_min           out_B
+            # else:
+            #       log(cdf_delta)                  out_A
+            out_A = torch.log(torch.clamp(cdf_delta, min=1e-12))
+            # NOTE, we adapt the bounds for our case
+            cond_B = (x > self.x_upper_bound).float()
+            out_B = (cond_B * log_one_minus_cdf_min + (1. - cond_B) * out_A)
+            cond_C = (x < self.x_lower_bound).float()
+            # NCKHW, =log(P^k(c))
+            log_probs = cond_C * log_cdf_plus + (1. - cond_C) * out_B
+
+            # modified
+            # with torch.no_grad():
+            # logit_pis = torch.ones_like(logit_pis)
+
+            # combine with pi, NCKHW, (-inf, 0]
+            if (self._num_params > 2):
+                log_probs_weighted = log_probs.add(log_softmax(logit_pis, dim=2))  # (-inf, 0]
+            else:
+                log_probs_weighted = log_probs
+
+            # final - SUM(log(exp(P))), NCHW
+            # print(log_probs_weighted.shape)
+            return -log_sum_exp(log_probs_weighted, dim=2)  # NCHW
+        elif K == 2:
+            prob0, mean0, log_scales0, prob1, mean1, log_scales1 = [
+                torch.chunk(l, 6, dim=1)[i].unsqueeze(2) for i in range(6)]
+            probs = torch.stack([prob0, prob1], dim=-1)
+            probs = 0.1 + 0.8 * F.softmax(probs, dim=-1)
+            means0 = mean0 * self.t
+            means1 = mean1 * self.t
+            #
+
+            log_scales0 = torch.clamp(log_scales0, min=_LOG_SCALES_MIN)
+            log_scales1 = torch.clamp(log_scales1, min=_LOG_SCALES_MIN)
+
+            centered_x0 = x - means0  # NCKHW
+            centered_x0 = centered_x0.abs()  # modified
+            #
+            centered_x1 = x - means1  # NCKHW
+            centered_x1 = centered_x1.abs()  # modified
+            #
+
+            #
+            inv_stdv0 = torch.exp(-log_scales0)
+
+            plus_in0 = inv_stdv0 * (- centered_x0 + self.bin_width / 2)
+            min_in0 = inv_stdv0 * (- centered_x0 - self.bin_width / 2)
+            cdf_plus0 = self._standardized_cumulative(plus_in0)  # S(sigma' * (x - mu + 1/255))
+            cdf_min0 = self._standardized_cumulative(min_in0)
+            # S(sigma' * (x - mu - 1/255)) == 1 / (1 + exp(sigma' * (x - mu - 1/255))
+            #
+            inv_stdv1 = torch.exp(-log_scales1)
+
+            plus_in1 = inv_stdv1 * (- centered_x1 + self.bin_width / 2)
+            min_in1 = inv_stdv1 * (- centered_x1 - self.bin_width / 2)
+            cdf_plus1 = self._standardized_cumulative(plus_in1)  # S(sigma' * (x - mu + 1/255))
+            cdf_min1 = self._standardized_cumulative(min_in1)
+            # S(sigma' * (x - mu - 1/255)) == 1 / (1 + exp(sigma' * (x - mu - 1/255))
+            #
+
+            log_cdf_plus0 = plus_in0 - F.softplus(plus_in0)  # log probability for edge case of 0
+            log_one_minus_cdf_min0 = -F.softplus(min_in0)
+
+            # print(00000000000000000,plus_in0,1111111111111111111, log_cdf_plus0,22222222222222, log_one_minus_cdf_min0)
+
+            log_cdf_plus1 = plus_in1 - F.softplus(plus_in1)  # log probability for edge case of 0
+            log_one_minus_cdf_min1 = -F.softplus(min_in1)
+
+            # if self.eval:
+            #     print(inv_stdv0.max(),inv_stdv1.max(),inv_stdv2.max(), 1111111111)
+            #
+            cdf_delta0 = cdf_plus0 - cdf_min0
+            cdf_delta1 = cdf_plus1 - cdf_min1
+            likelihoods = probs[:, :, :, :, :, 0] * cdf_delta0 + probs[:, :, :, :, :, 1] * cdf_delta1
+
+            log_cdf_plus = probs[:, :, :, :, :, 0] * log_cdf_plus0 + probs[:, :, :, :, :,
+                                                                     1] * log_cdf_plus1
+            log_one_minus_cdf_min = probs[:, :, :, :, :, 0] * log_one_minus_cdf_min0 + probs[:, :, :, :, :,
+                                                                                       1] * log_one_minus_cdf_min1
+
+            out_A = torch.log(torch.clamp(likelihoods, min=1e-12))
+            # NOTE, we adapt the bounds for our case
+            cond_B = (x > self.x_upper_bound).float()
+            out_B = (cond_B * log_one_minus_cdf_min + (1. - cond_B) * out_A)
+            cond_C = (x < self.x_lower_bound).float()
+            # NCKHW, =log(P^k(c))
+            log_probs = cond_C * log_cdf_plus + (1. - cond_C) * out_B
+
+            return -log_sum_exp(log_probs, dim=2)
+        elif K == 3:
+            prob0, mean0, log_scales0, prob1, mean1, log_scales1, prob2, mean2, log_scales2 = [
+                torch.chunk(l, 9, dim=1)[i].unsqueeze(2) for i in range(9)]
+            probs = torch.stack([prob0, prob1, prob2], dim=-1)
+            probs = 0.1 + 0.7 * F.softmax(probs, dim=-1)
+            means0 = mean0 * self.t
+            means1 = mean1 * self.t
+            means2 = mean2 * self.t
+            #
+
+            log_scales0 = torch.clamp(log_scales0, min=_LOG_SCALES_MIN)
+            log_scales1 = torch.clamp(log_scales1, min=_LOG_SCALES_MIN)
+            log_scales2 = torch.clamp(log_scales2, min=_LOG_SCALES_MIN)
+
+            centered_x0 = x - means0  # NCKHW
+            centered_x0 = centered_x0.abs()  # modified
+            #
+            centered_x1 = x - means1  # NCKHW
+            centered_x1 = centered_x1.abs()  # modified
+            #
+            centered_x2 = x - means2  # NCKHW
+            centered_x2 = centered_x2.abs()  # modified
+            #
+            inv_stdv0 = torch.exp(-log_scales0)
+
+            plus_in0 = inv_stdv0 * (- centered_x0 + self.bin_width / 2)
+            min_in0 = inv_stdv0 * (- centered_x0 - self.bin_width / 2)
+            cdf_plus0 = self._standardized_cumulative(plus_in0)  # S(sigma' * (x - mu + 1/255))
+            cdf_min0 = self._standardized_cumulative(min_in0)
+            # S(sigma' * (x - mu - 1/255)) == 1 / (1 + exp(sigma' * (x - mu - 1/255))
+            #
+            inv_stdv1 = torch.exp(-log_scales1)
+
+            plus_in1 = inv_stdv1 * (- centered_x1 + self.bin_width / 2)
+            min_in1 = inv_stdv1 * (- centered_x1 - self.bin_width / 2)
+            cdf_plus1 = self._standardized_cumulative(plus_in1)  # S(sigma' * (x - mu + 1/255))
+            cdf_min1 = self._standardized_cumulative(min_in1)
+            # S(sigma' * (x - mu - 1/255)) == 1 / (1 + exp(sigma' * (x - mu - 1/255))
+            #
+            inv_stdv2 = torch.exp(-log_scales2)
+
+            plus_in2 = inv_stdv2 * (- centered_x2 + self.bin_width / 2)
+            min_in2 = inv_stdv2 * (- centered_x2 - self.bin_width / 2)
+            cdf_plus2 = self._standardized_cumulative(plus_in2)  # S(sigma' * (x - mu + 1/255))
+            cdf_min2 = self._standardized_cumulative(min_in2)
+            # S(sigma' * (x - mu - 1/255)) == 1 / (1 + exp(sigma' * (x - mu - 1/255))
+
+            log_cdf_plus0 = plus_in0 - F.softplus(plus_in0)  # log probability for edge case of 0
+            log_one_minus_cdf_min0 = -F.softplus(min_in0)
+
+            # print(00000000000000000,plus_in0,1111111111111111111, log_cdf_plus0,22222222222222, log_one_minus_cdf_min0)
+
+            log_cdf_plus1 = plus_in1 - F.softplus(plus_in1)  # log probability for edge case of 0
+            log_one_minus_cdf_min1 = -F.softplus(min_in1)
+
+            # #
+
+            log_cdf_plus2 = plus_in2 - F.softplus(plus_in2)  # log probability for edge case of 0
+            log_one_minus_cdf_min2 = -F.softplus(min_in2)
+
+            # if self.eval:
+            #     print(inv_stdv0.max(),inv_stdv1.max(),inv_stdv2.max(), 1111111111)
+            #
+            cdf_delta0 = cdf_plus0 - cdf_min0
+            cdf_delta1 = cdf_plus1 - cdf_min1
+            cdf_delta2 = cdf_plus2 - cdf_min2
+            likelihoods = probs[:, :, :, :, :, 0] * cdf_delta0 + probs[:, :, :, :, :, 1] * cdf_delta1 + \
+                          probs[:, :, :, :, :, 2] * cdf_delta2
+
+            log_cdf_plus = probs[:, :, :, :, :, 0] * log_cdf_plus0 + probs[:, :, :, :, :, 1] * log_cdf_plus1 + probs[:,
+                                                                                                               :, :, :,
+                                                                                                               :,
+                                                                                                               2] * log_cdf_plus2
+            log_one_minus_cdf_min = probs[:, :, :, :, :, 0] * log_one_minus_cdf_min0 + probs[:, :, :, :, :,
+                                                                                       1] * log_one_minus_cdf_min1 + probs[
+                                                                                                                     :,
+                                                                                                                     :,
+                                                                                                                     :,
+                                                                                                                     :,
+                                                                                                                     :,
+                                                                                                                     2] * log_one_minus_cdf_min2
+
+            out_A = torch.log(torch.clamp(likelihoods, min=1e-12))
+            # NOTE, we adapt the bounds for our case
+            cond_B = (x > self.x_upper_bound).float()
+            out_B = (cond_B * log_one_minus_cdf_min + (1. - cond_B) * out_A)
+            cond_C = (x < self.x_lower_bound).float()
+            # NCKHW, =log(P^k(c))
+            log_probs = cond_C * log_cdf_plus + (1. - cond_C) * out_B
+
+            return -log_sum_exp(log_probs, dim=2)
+
+        elif K == 4:
+            prob0, mean0, log_scales0, prob1, mean1, log_scales1, prob2, mean2, log_scales2, prob3, mean3, log_scales3 = [
+                torch.chunk(l, 12, dim=1)[i].unsqueeze(2) for i in range(12)]
+            probs = torch.stack([prob0, prob1, prob2, prob3], dim=-1)
+            probs = 0.05 + 0.8 * F.softmax(probs, dim=-1)
+            means0 = mean0 * self.t
+            means1 = mean1 * self.t
+            means2 = mean2 * self.t
+            means3 = mean3 * self.t
+            #
+
+            log_scales0 = torch.clamp(log_scales0, min=_LOG_SCALES_MIN)
+            log_scales1 = torch.clamp(log_scales1, min=_LOG_SCALES_MIN)
+            log_scales2 = torch.clamp(log_scales2, min=_LOG_SCALES_MIN)
+            log_scales3 = torch.clamp(log_scales3, min=_LOG_SCALES_MIN)
+
+            centered_x0 = x - means0  # NCKHW
+            centered_x0 = centered_x0.abs()  # modified
+            #
+            centered_x1 = x - means1  # NCKHW
+            centered_x1 = centered_x1.abs()  # modified
+            #
+            centered_x2 = x - means2  # NCKHW
+            centered_x2 = centered_x2.abs()  # modified
+
+            centered_x3 = x - means3  # NCKHW
+            centered_x3 = centered_x3.abs()  # modified
+            #
+            inv_stdv0 = torch.exp(-log_scales0)
+
+            plus_in0 = inv_stdv0 * (- centered_x0 + self.bin_width / 2)
+            min_in0 = inv_stdv0 * (- centered_x0 - self.bin_width / 2)
+            cdf_plus0 = self._standardized_cumulative(plus_in0)  # S(sigma' * (x - mu + 1/255))
+            cdf_min0 = self._standardized_cumulative(min_in0)
+            # S(sigma' * (x - mu - 1/255)) == 1 / (1 + exp(sigma' * (x - mu - 1/255))
+            #
+            inv_stdv1 = torch.exp(-log_scales1)
+
+            plus_in1 = inv_stdv1 * (- centered_x1 + self.bin_width / 2)
+            min_in1 = inv_stdv1 * (- centered_x1 - self.bin_width / 2)
+            cdf_plus1 = self._standardized_cumulative(plus_in1)  # S(sigma' * (x - mu + 1/255))
+            cdf_min1 = self._standardized_cumulative(min_in1)
+            # S(sigma' * (x - mu - 1/255)) == 1 / (1 + exp(sigma' * (x - mu - 1/255))
+            #
+            inv_stdv2 = torch.exp(-log_scales2)
+
+            plus_in2 = inv_stdv2 * (- centered_x2 + self.bin_width / 2)
+            min_in2 = inv_stdv2 * (- centered_x2 - self.bin_width / 2)
+            cdf_plus2 = self._standardized_cumulative(plus_in2)  # S(sigma' * (x - mu + 1/255))
+            cdf_min2 = self._standardized_cumulative(min_in2)
+            # S(sigma' * (x - mu - 1/255)) == 1 / (1 + exp(sigma' * (x - mu - 1/255))
+            #
+
+            inv_stdv3 = torch.exp(-log_scales3)
+
+            plus_in3 = inv_stdv3 * (- centered_x3 + self.bin_width / 2)
+            min_in3 = inv_stdv3 * (- centered_x3 - self.bin_width / 2)
+            cdf_plus3 = self._standardized_cumulative(plus_in3)  # S(sigma' * (x - mu + 1/255))
+            cdf_min3 = self._standardized_cumulative(min_in3)
+
+            log_cdf_plus0 = plus_in0 - F.softplus(plus_in0)  # log probability for edge case of 0
+            log_one_minus_cdf_min0 = -F.softplus(min_in0)
+
+            # print(00000000000000000,plus_in0,1111111111111111111, log_cdf_plus0,22222222222222, log_one_minus_cdf_min0)
+
+            log_cdf_plus1 = plus_in1 - F.softplus(plus_in1)  # log probability for edge case of 0
+            log_one_minus_cdf_min1 = -F.softplus(min_in1)
+
+            # #
+
+            log_cdf_plus2 = plus_in2 - F.softplus(plus_in2)  # log probability for edge case of 0
+            log_one_minus_cdf_min2 = -F.softplus(min_in2)
+
+            log_cdf_plus3 = plus_in3 - F.softplus(plus_in3)  # log probability for edge case of 0
+            log_one_minus_cdf_min3 = -F.softplus(min_in3)
+            # if self.eval:
+            #     print(inv_stdv0.max(),inv_stdv1.max(),inv_stdv2.max(), 1111111111)
+            #
+            cdf_delta0 = cdf_plus0 - cdf_min0
+            cdf_delta1 = cdf_plus1 - cdf_min1
+            cdf_delta2 = cdf_plus2 - cdf_min2
+            cdf_delta3 = cdf_plus3 - cdf_min3
+            likelihoods = probs[:, :, :, :, :, 0] * cdf_delta0 + probs[:, :, :, :, :, 1] * cdf_delta1 + \
+                          probs[:, :, :, :, :, 2] * cdf_delta2 + probs[:, :, :, :, :, 3] * cdf_delta3
+
+            log_cdf_plus = probs[:, :, :, :, :, 0] * log_cdf_plus0 + probs[:, :, :, :, :, 1] * log_cdf_plus1 + \
+                           probs[:, :, :, :, :, 2] * log_cdf_plus2 + probs[:, :, :, :, :, 3] * log_cdf_plus3
+
+            log_one_minus_cdf_min = probs[:, :, :, :, :, 0] * log_one_minus_cdf_min0 + \
+                                    probs[:, :, :, :, :, 1] * log_one_minus_cdf_min1 + probs[:, :, :, :, :,
+                                                                                       2] * log_one_minus_cdf_min2 + \
+                                    probs[:, :, :, :, :, 3] * log_one_minus_cdf_min3
+
+            out_A = torch.log(torch.clamp(likelihoods, min=1e-12))
+            # NOTE, we adapt the bounds for our case
+            cond_B = (x > self.x_upper_bound).float()
+            out_B = (cond_B * log_one_minus_cdf_min + (1. - cond_B) * out_A)
+            cond_C = (x < self.x_lower_bound).float()
+            # NCKHW, =log(P^k(c))
+            log_probs = cond_C * log_cdf_plus + (1. - cond_C) * out_B
+
+            return -log_sum_exp(log_probs, dim=2)
+        elif K == 5:
+            prob0, mean0, log_scales0, prob1, mean1, log_scales1, prob2, mean2, log_scales2, prob3, mean3, log_scales3, \
+            prob4, mean4, log_scales4 = [torch.chunk(l, 15, dim=1)[i].unsqueeze(2) for i in range(15)]
+            probs = torch.stack([prob0, prob1, prob2, prob3, prob4], dim=-1)
+            probs = 0.05 + 0.75 * F.softmax(probs, dim=-1)
+            means0 = mean0 * self.t
+            means1 = mean1 * self.t
+            means2 = mean2 * self.t
+            means3 = mean3 * self.t
+            means4 = mean4 * self.t
+            #
+
+            log_scales0 = torch.clamp(log_scales0, min=_LOG_SCALES_MIN)
+            log_scales1 = torch.clamp(log_scales1, min=_LOG_SCALES_MIN)
+            log_scales2 = torch.clamp(log_scales2, min=_LOG_SCALES_MIN)
+            log_scales3 = torch.clamp(log_scales3, min=_LOG_SCALES_MIN)
+            log_scales4 = torch.clamp(log_scales4, min=_LOG_SCALES_MIN)
+
+            centered_x0 = x - means0  # NCKHW
+            centered_x0 = centered_x0.abs()  # modified
+            #
+            centered_x1 = x - means1  # NCKHW
+            centered_x1 = centered_x1.abs()  # modified
+            #
+            centered_x2 = x - means2  # NCKHW
+            centered_x2 = centered_x2.abs()  # modified
+
+            centered_x3 = x - means3  # NCKHW
+            centered_x3 = centered_x3.abs()  # modified
+
+            centered_x4 = x - means4  # NCKHW
+            centered_x4 = centered_x4.abs()  # modified
+            #
+            inv_stdv0 = torch.exp(-log_scales0)
+
+            plus_in0 = inv_stdv0 * (- centered_x0 + self.bin_width / 2)
+            min_in0 = inv_stdv0 * (- centered_x0 - self.bin_width / 2)
+            cdf_plus0 = self._standardized_cumulative(plus_in0)  # S(sigma' * (x - mu + 1/255))
+            cdf_min0 = self._standardized_cumulative(min_in0)
+            # S(sigma' * (x - mu - 1/255)) == 1 / (1 + exp(sigma' * (x - mu - 1/255))
+            #
+            inv_stdv1 = torch.exp(-log_scales1)
+
+            plus_in1 = inv_stdv1 * (- centered_x1 + self.bin_width / 2)
+            min_in1 = inv_stdv1 * (- centered_x1 - self.bin_width / 2)
+            cdf_plus1 = self._standardized_cumulative(plus_in1)  # S(sigma' * (x - mu + 1/255))
+            cdf_min1 = self._standardized_cumulative(min_in1)
+            # S(sigma' * (x - mu - 1/255)) == 1 / (1 + exp(sigma' * (x - mu - 1/255))
+            #
+            inv_stdv2 = torch.exp(-log_scales2)
+
+            plus_in2 = inv_stdv2 * (- centered_x2 + self.bin_width / 2)
+            min_in2 = inv_stdv2 * (- centered_x2 - self.bin_width / 2)
+            cdf_plus2 = self._standardized_cumulative(plus_in2)  # S(sigma' * (x - mu + 1/255))
+            cdf_min2 = self._standardized_cumulative(min_in2)
+            # S(sigma' * (x - mu - 1/255)) == 1 / (1 + exp(sigma' * (x - mu - 1/255))
+            #
+
+            inv_stdv3 = torch.exp(-log_scales3)
+
+            plus_in3 = inv_stdv3 * (- centered_x3 + self.bin_width / 2)
+            min_in3 = inv_stdv3 * (- centered_x3 - self.bin_width / 2)
+            cdf_plus3 = self._standardized_cumulative(plus_in3)  # S(sigma' * (x - mu + 1/255))
+            cdf_min3 = self._standardized_cumulative(min_in3)
+
+            inv_stdv4 = torch.exp(-log_scales4)
+
+            plus_in4 = inv_stdv4 * (- centered_x4 + self.bin_width / 2)
+            min_in4 = inv_stdv4 * (- centered_x4 - self.bin_width / 2)
+            cdf_plus4 = self._standardized_cumulative(plus_in4)  # S(sigma' * (x - mu + 1/255))
+            cdf_min4 = self._standardized_cumulative(min_in4)
+
+            log_cdf_plus0 = plus_in0 - F.softplus(plus_in0)  # log probability for edge case of 0
+            log_one_minus_cdf_min0 = -F.softplus(min_in0)
+
+            # print(00000000000000000,plus_in0,1111111111111111111, log_cdf_plus0,22222222222222, log_one_minus_cdf_min0)
+
+            log_cdf_plus1 = plus_in1 - F.softplus(plus_in1)  # log probability for edge case of 0
+            log_one_minus_cdf_min1 = -F.softplus(min_in1)
+
+            # #
+
+            log_cdf_plus2 = plus_in2 - F.softplus(plus_in2)  # log probability for edge case of 0
+            log_one_minus_cdf_min2 = -F.softplus(min_in2)
+
+            log_cdf_plus3 = plus_in3 - F.softplus(plus_in3)  # log probability for edge case of 0
+            log_one_minus_cdf_min3 = -F.softplus(min_in3)
+
+            log_cdf_plus4 = plus_in4 - F.softplus(plus_in4)  # log probability for edge case of 0
+            log_one_minus_cdf_min4 = -F.softplus(min_in4)
+            # if self.eval:
+            #     print(inv_stdv0.max(),inv_stdv1.max(),inv_stdv2.max(), 1111111111)
+            #
+            cdf_delta0 = cdf_plus0 - cdf_min0
+            cdf_delta1 = cdf_plus1 - cdf_min1
+            cdf_delta2 = cdf_plus2 - cdf_min2
+            cdf_delta3 = cdf_plus3 - cdf_min3
+            cdf_delta4 = cdf_plus4 - cdf_min4
+            likelihoods = probs[:, :, :, :, :, 0] * cdf_delta0 + probs[:, :, :, :, :, 1] * cdf_delta1 + \
+                          probs[:, :, :, :, :, 2] * cdf_delta2 + probs[:, :, :, :, :, 3] * cdf_delta3 + \
+                          probs[:, :, :, :, :, 4] * cdf_delta4
+
+            log_cdf_plus = probs[:, :, :, :, :, 0] * log_cdf_plus0 + probs[:, :, :, :, :, 1] * log_cdf_plus1 + \
+                           probs[:, :, :, :, :, 2] * log_cdf_plus2 + probs[:, :, :, :, :, 3] * log_cdf_plus3 + \
+                           probs[:, :, :, :, :, 4] * log_cdf_plus4
+
+            log_one_minus_cdf_min = probs[:, :, :, :, :, 0] * log_one_minus_cdf_min0 + \
+                                    probs[:, :, :, :, :, 1] * log_one_minus_cdf_min1 + probs[:, :, :, :, :,
+                                                                                       2] * log_one_minus_cdf_min2 + \
+                                    probs[:, :, :, :, :, 3] * log_one_minus_cdf_min3 + probs[:, :, :, :, :,
+                                                                                       4] * log_one_minus_cdf_min4
+
+            out_A = torch.log(torch.clamp(likelihoods, min=1e-12))
+            # NOTE, we adapt the bounds for our case
+            cond_B = (x > self.x_upper_bound).float()
+            out_B = (cond_B * log_one_minus_cdf_min + (1. - cond_B) * out_A)
+            cond_C = (x < self.x_lower_bound).float()
+            # NCKHW, =log(P^k(c))
+            log_probs = cond_C * log_cdf_plus + (1. - cond_C) * out_B
+
+            return -log_sum_exp(log_probs, dim=2)
+        elif K == 10:
+            prob0, mean0, log_scales0, prob1, mean1, log_scales1, prob2, mean2, log_scales2, prob3, mean3, log_scales3, \
+            prob4, mean4, log_scales4, prob5, mean5, log_scales5, prob6, mean6, log_scales6, prob7, mean7, log_scales7, prob8, mean8, log_scales8, \
+            prob9, mean9, log_scales9 = [torch.chunk(l, 30, dim=1)[i].unsqueeze(2) for i in range(30)]
+            probs = torch.stack([prob0, prob1, prob2, prob3, prob4, prob5, prob6, prob7, prob8, prob9], dim=-1)
+            probs = 0.05 + 0.5 * F.softmax(probs, dim=-1)
+            means0 = mean0 * self.t
+            means1 = mean1 * self.t
+            means2 = mean2 * self.t
+            means3 = mean3 * self.t
+            means4 = mean4 * self.t
+            means5 = mean5 * self.t
+            means6 = mean6 * self.t
+            means7 = mean7 * self.t
+            means8 = mean8 * self.t
+            means9 = mean9 * self.t
+            #
+
+            log_scales0 = torch.clamp(log_scales0, min=_LOG_SCALES_MIN)
+            log_scales1 = torch.clamp(log_scales1, min=_LOG_SCALES_MIN)
+            log_scales2 = torch.clamp(log_scales2, min=_LOG_SCALES_MIN)
+            log_scales3 = torch.clamp(log_scales3, min=_LOG_SCALES_MIN)
+            log_scales4 = torch.clamp(log_scales4, min=_LOG_SCALES_MIN)
+            log_scales5 = torch.clamp(log_scales5, min=_LOG_SCALES_MIN)
+            log_scales6 = torch.clamp(log_scales6, min=_LOG_SCALES_MIN)
+            log_scales7 = torch.clamp(log_scales7, min=_LOG_SCALES_MIN)
+            log_scales8 = torch.clamp(log_scales8, min=_LOG_SCALES_MIN)
+            log_scales9 = torch.clamp(log_scales9, min=_LOG_SCALES_MIN)
+
+            centered_x0 = x - means0  # NCKHW
+            centered_x0 = centered_x0.abs()  # modified
+            #
+            centered_x1 = x - means1  # NCKHW
+            centered_x1 = centered_x1.abs()  # modified
+            #
+            centered_x2 = x - means2  # NCKHW
+            centered_x2 = centered_x2.abs()  # modified
+
+            centered_x3 = x - means3  # NCKHW
+            centered_x3 = centered_x3.abs()  # modified
+
+            centered_x4 = x - means4  # NCKHW
+            centered_x4 = centered_x4.abs()  # modified
+
+            centered_x5 = x - means5  # NCKHW
+            centered_x5 = centered_x5.abs()  # modified
+            #
+            centered_x6 = x - means6  # NCKHW
+            centered_x6 = centered_x6.abs()  # modified
+            #
+            centered_x7 = x - means7  # NCKHW
+            centered_x7 = centered_x7.abs()  # modified
+
+            centered_x8 = x - means8  # NCKHW
+            centered_x8 = centered_x8.abs()  # modified
+
+            centered_x9 = x - means9  # NCKHW
+            centered_x9 = centered_x9.abs()  # modified
+
+            inv_stdv0 = torch.exp(-log_scales0)
+
+            plus_in0 = inv_stdv0 * (- centered_x0 + self.bin_width / 2)
+            min_in0 = inv_stdv0 * (- centered_x0 - self.bin_width / 2)
+            cdf_plus0 = self._standardized_cumulative(plus_in0)  # S(sigma' * (x - mu + 1/255))
+            cdf_min0 = self._standardized_cumulative(min_in0)
+            # S(sigma' * (x - mu - 1/255)) == 1 / (1 + exp(sigma' * (x - mu - 1/255))
+            #
+            inv_stdv1 = torch.exp(-log_scales1)
+
+            plus_in1 = inv_stdv1 * (- centered_x1 + self.bin_width / 2)
+            min_in1 = inv_stdv1 * (- centered_x1 - self.bin_width / 2)
+            cdf_plus1 = self._standardized_cumulative(plus_in1)  # S(sigma' * (x - mu + 1/255))
+            cdf_min1 = self._standardized_cumulative(min_in1)
+            # S(sigma' * (x - mu - 1/255)) == 1 / (1 + exp(sigma' * (x - mu - 1/255))
+            #
+            inv_stdv2 = torch.exp(-log_scales2)
+
+            plus_in2 = inv_stdv2 * (- centered_x2 + self.bin_width / 2)
+            min_in2 = inv_stdv2 * (- centered_x2 - self.bin_width / 2)
+            cdf_plus2 = self._standardized_cumulative(plus_in2)  # S(sigma' * (x - mu + 1/255))
+            cdf_min2 = self._standardized_cumulative(min_in2)
+            # S(sigma' * (x - mu - 1/255)) == 1 / (1 + exp(sigma' * (x - mu - 1/255))
+            #
+
+            inv_stdv3 = torch.exp(-log_scales3)
+
+            plus_in3 = inv_stdv3 * (- centered_x3 + self.bin_width / 2)
+            min_in3 = inv_stdv3 * (- centered_x3 - self.bin_width / 2)
+            cdf_plus3 = self._standardized_cumulative(plus_in3)  # S(sigma' * (x - mu + 1/255))
+            cdf_min3 = self._standardized_cumulative(min_in3)
+
+            inv_stdv4 = torch.exp(-log_scales4)
+
+            plus_in4 = inv_stdv4 * (- centered_x4 + self.bin_width / 2)
+            min_in4 = inv_stdv4 * (- centered_x4 - self.bin_width / 2)
+            cdf_plus4 = self._standardized_cumulative(plus_in4)  # S(sigma' * (x - mu + 1/255))
+            cdf_min4 = self._standardized_cumulative(min_in4)
+
+            inv_stdv5 = torch.exp(-log_scales5)
+
+            plus_in5 = inv_stdv5 * (- centered_x5 + self.bin_width / 2)
+            min_in5 = inv_stdv5 * (- centered_x5 - self.bin_width / 2)
+            cdf_plus5 = self._standardized_cumulative(plus_in5)  # S(sigma' * (x - mu + 1/255))
+            cdf_min5 = self._standardized_cumulative(min_in5)
+            # S(sigma' * (x - mu - 1/255)) == 1 / (1 + exp(sigma' * (x - mu - 1/255))
+            #
+            inv_stdv6 = torch.exp(-log_scales6)
+
+            plus_in6 = inv_stdv6 * (- centered_x6 + self.bin_width / 2)
+            min_in6 = inv_stdv6 * (- centered_x6 - self.bin_width / 2)
+            cdf_plus6 = self._standardized_cumulative(plus_in6)  # S(sigma' * (x - mu + 1/255))
+            cdf_min6 = self._standardized_cumulative(min_in6)
+            # S(sigma' * (x - mu - 1/255)) == 1 / (1 + exp(sigma' * (x - mu - 1/255))
+            #
+            inv_stdv7 = torch.exp(-log_scales7)
+
+            plus_in7 = inv_stdv7 * (- centered_x7 + self.bin_width / 2)
+            min_in7 = inv_stdv7 * (- centered_x7 - self.bin_width / 2)
+            cdf_plus7 = self._standardized_cumulative(plus_in7)  # S(sigma' * (x - mu + 1/255))
+            cdf_min7 = self._standardized_cumulative(min_in7)
+            # S(sigma' * (x - mu - 1/255)) == 1 / (1 + exp(sigma' * (x - mu - 1/255))
+            #
+
+            inv_stdv8 = torch.exp(-log_scales8)
+
+            plus_in8 = inv_stdv8 * (- centered_x8 + self.bin_width / 2)
+            min_in8 = inv_stdv8 * (- centered_x8 - self.bin_width / 2)
+            cdf_plus8 = self._standardized_cumulative(plus_in8)  # S(sigma' * (x - mu + 1/255))
+            cdf_min8 = self._standardized_cumulative(min_in8)
+
+            inv_stdv9 = torch.exp(-log_scales9)
+
+            plus_in9 = inv_stdv9 * (- centered_x9 + self.bin_width / 2)
+            min_in9 = inv_stdv9 * (- centered_x9 - self.bin_width / 2)
+            cdf_plus9 = self._standardized_cumulative(plus_in9)  # S(sigma' * (x - mu + 1/255))
+            cdf_min9 = self._standardized_cumulative(min_in9)
+
+            log_cdf_plus0 = plus_in0 - F.softplus(plus_in0)  # log probability for edge case of 0
+            log_one_minus_cdf_min0 = -F.softplus(min_in0)
+
+            # print(00000000000000000,plus_in0,1111111111111111111, log_cdf_plus0,22222222222222, log_one_minus_cdf_min0)
+
+            log_cdf_plus1 = plus_in1 - F.softplus(plus_in1)  # log probability for edge case of 0
+            log_one_minus_cdf_min1 = -F.softplus(min_in1)
+
+            # #
+
+            log_cdf_plus2 = plus_in2 - F.softplus(plus_in2)  # log probability for edge case of 0
+            log_one_minus_cdf_min2 = -F.softplus(min_in2)
+
+            log_cdf_plus3 = plus_in3 - F.softplus(plus_in3)  # log probability for edge case of 0
+            log_one_minus_cdf_min3 = -F.softplus(min_in3)
+
+            log_cdf_plus4 = plus_in4 - F.softplus(plus_in4)  # log probability for edge case of 0
+            log_one_minus_cdf_min4 = -F.softplus(min_in4)
+
+            log_cdf_plus5 = plus_in5 - F.softplus(plus_in5)  # log probability for edge case of 0
+            log_one_minus_cdf_min5 = -F.softplus(min_in5)
+
+            # print(00000000000000000,plus_in0,1111111111111111111, log_cdf_plus0,22222222222222, log_one_minus_cdf_min0)
+            log_cdf_plus6 = plus_in6 - F.softplus(plus_in6)  # log probability for edge case of 0
+            log_one_minus_cdf_min6 = -F.softplus(min_in6)
+
+            # #
+
+            log_cdf_plus7 = plus_in7 - F.softplus(plus_in7)  # log probability for edge case of 0
+            log_one_minus_cdf_min7 = -F.softplus(min_in7)
+
+            log_cdf_plus8 = plus_in8 - F.softplus(plus_in8)  # log probability for edge case of 0
+            log_one_minus_cdf_min8 = -F.softplus(min_in8)
+
+            log_cdf_plus9 = plus_in9 - F.softplus(plus_in9)  # log probability for edge case of 0
+            log_one_minus_cdf_min9 = -F.softplus(min_in9)
+            # if self.eval:
+            #     print(inv_stdv0.max(),inv_stdv1.max(),inv_stdv2.max(), 1111111111)
+            #
+            cdf_delta0 = cdf_plus0 - cdf_min0
+            cdf_delta1 = cdf_plus1 - cdf_min1
+            cdf_delta2 = cdf_plus2 - cdf_min2
+            cdf_delta3 = cdf_plus3 - cdf_min3
+            cdf_delta4 = cdf_plus4 - cdf_min4
+            cdf_delta5 = cdf_plus5 - cdf_min5
+            cdf_delta6 = cdf_plus6 - cdf_min6
+            cdf_delta7 = cdf_plus7 - cdf_min7
+            cdf_delta8 = cdf_plus8 - cdf_min8
+            cdf_delta9 = cdf_plus9 - cdf_min9
+
+            likelihoods = probs[:, :, :, :, :, 0] * cdf_delta0 + probs[:, :, :, :, :, 1] * cdf_delta1 + \
+                          probs[:, :, :, :, :, 2] * cdf_delta2 + probs[:, :, :, :, :, 3] * cdf_delta3 + \
+                          probs[:, :, :, :, :, 4] * cdf_delta4 + probs[:, :, :, :, :, 5] * cdf_delta5 + \
+                          probs[:, :, :, :, :, 6] * cdf_delta6 + probs[:, :, :, :, :, 7] * cdf_delta7 + \
+                          probs[:, :, :, :, :, 8] * cdf_delta8 + probs[:, :, :, :, :, 9] * cdf_delta9
+
+            log_cdf_plus = probs[:, :, :, :, :, 0] * log_cdf_plus0 + probs[:, :, :, :, :, 1] * log_cdf_plus1 + \
+                           probs[:, :, :, :, :, 2] * log_cdf_plus2 + probs[:, :, :, :, :, 3] * log_cdf_plus3 + \
+                           probs[:, :, :, :, :, 4] * log_cdf_plus4 + probs[:, :, :, :, :, 5] * log_cdf_plus5 + \
+                           probs[:, :, :, :, :, 6] * log_cdf_plus6 + probs[:, :, :, :, :, 7] * log_cdf_plus7 + \
+                           probs[:, :, :, :, :, 8] * log_cdf_plus8 + probs[:, :, :, :, :, 9] * log_cdf_plus9
+
+            log_one_minus_cdf_min = probs[:, :, :, :, :, 0] * log_one_minus_cdf_min0 + probs[:, :, :, :, :,
+                                                                                       1] * log_one_minus_cdf_min1 + \
+                                    probs[:, :, :, :, :, 2] * log_one_minus_cdf_min2 + probs[:, :, :, :, :,
+                                                                                       3] * log_one_minus_cdf_min3 + \
+                                    probs[:, :, :, :, :, 4] * log_one_minus_cdf_min4 + probs[:, :, :, :, :,
+                                                                                       5] * log_one_minus_cdf_min5 + \
+                                    probs[:, :, :, :, :, 6] * log_one_minus_cdf_min6 + probs[:, :, :, :, :,
+                                                                                       7] * log_one_minus_cdf_min7 + \
+                                    probs[:, :, :, :, :, 8] * log_one_minus_cdf_min8 + probs[:, :, :, :, :,
+                                                                                       9] * log_one_minus_cdf_min9
+
+            out_A = torch.log(torch.clamp(likelihoods, min=1e-12))
+            # NOTE, we adapt the bounds for our case
+            cond_B = (x > self.x_upper_bound).float()
+            out_B = (cond_B * log_one_minus_cdf_min + (1. - cond_B) * out_A)
+            cond_C = (x < self.x_lower_bound).float()
+            # NCKHW, =log(P^k(c))
+            log_probs = cond_C * log_cdf_plus + (1. - cond_C) * out_B
+
+            return -log_sum_exp(log_probs, dim=2)
+
+    def pmf_pixel(self, l, C):
+        """ PMF of pixel-wise
+        :param l: predicted distribution, i.e., NKpHW, see above
+        :param C: number of channels
+        :return: pmf table, i.e., [N,C,1,1,Lp]
+        """
+
+        N, Kp, H, W = l.shape
+        assert H == 1 and W == 1
+
+        K = non_shared_get_K(Kp, C, self._num_params)
+        targets = torch.linspace(self.x_min, self.x_max,
+                                 self.L, dtype=torch.float32, device=l.device)
+        targets = targets.repeat(N, C, K, H, W, 1)  # NCKHWL
+
+        # we have, for each channel: K pi / K mu / K sigma / [K coeffs]
+        # note that this only holds for C=3 as for other channels, there would be more than 3*K coeffs
+        # but non_shared only holds for the C=3 case
+        l = l.reshape(N, self._num_params, C, K, H, W)
+
+        logit_pis = l[:, 0, ...]  # NCKHW
+        means = l[:, 1, ...]  # NCKHW
+        log_scales = torch.clamp(l[:, 2, ...], min=_LOG_SCALES_MIN)  # NCKHW, is >= -7
+
+        ##### modified: select scale from SCALE_TABLE #####
+        scale_table = torch.tensor(SCALE_TABLE, dtype=torch.float32).to(l.device)
+        # align dimension
+        scale_table = scale_table.repeat([N, C, K, H, W, 1])  # NCKHWLp
+        log_scales = log_scales.unsqueeze(-1)
+        # Get indice of scale from table
+        indice = log_scales > scale_table
+        indice = indice.sum(-1, keepdim=True)  # index, no need to +1
+
+        log_scales = torch.gather(scale_table, -1, indice)
+        log_scales = log_scales.squeeze(-1)
+        ####################
+
+        # align shape
+        logit_pis = logit_pis.unsqueeze(-1)  # NCKHW1
+        means = means.unsqueeze(-1)  # NCHW1
+        log_scales = log_scales.unsqueeze(-1)  # NCKHW1
+
+        x = targets
+        centered_x = x - means  # NCKHWL
+
+        # Calc P = cdf_delta
+        inv_stdv = torch.exp(-log_scales)  # <= exp(7), is exp(-sigma), inverse std. deviation, i.e., sigma'
+        plus_in = inv_stdv * (centered_x + self.bin_width / 2)  # modified
+        min_in = inv_stdv * (centered_x - self.bin_width / 2)  # modified
+
+        #
+        cdf_plus = self._standardized_cumulative(plus_in)
+        cdf_min = self._standardized_cumulative(min_in)
+
+        # the following two follow from the definition of the logistic distribution
+        log_cdf_plus = plus_in - F.softplus(plus_in)  # log probability for edge case of 0
+        log_one_minus_cdf_min = -F.softplus(min_in)  # log probability for edge case of 255
+        # N1HWL, P^k(c)
+        cdf_delta = cdf_plus - cdf_min  # probability for all other cases, essentially log_cdf_plus + log_one_minus_cdf_min
+
+        # NOTE:
+        out_A = torch.log(torch.clamp(cdf_delta, min=1e-12))
+        # NOTE, we adapt the bounds for our case
+        cond_B = (x > self.x_upper_bound).float()
+        out_B = (cond_B * log_one_minus_cdf_min + (1. - cond_B) * out_A)
+        cond_C = (x < self.x_lower_bound).float()
+        # N1HWL, =log(P^k(c))
+        log_probs = cond_C * log_cdf_plus + (1. - cond_C) * out_B
+
+        # Set pis to constant=1.  modified
+        with torch.no_grad():
+            logit_pis = torch.ones_like(logit_pis)
+
+        # combine with pi, N1KHWL, (-inf, 0]
+        log_probs_weighted = log_probs.add(
+            log_softmax(logit_pis, dim=2))  # (-inf, 0]
+
+        # final P of target list, NCHWL
+        return log_sum_exp(log_probs_weighted, dim=2).exp_()  # NCHWL
+
+    def build_table(self, device):
+        """Build CDF table"""
+
+        T = SCALE_TABLE.shape[0]
+
+        # Scale PMF table: [T, Lp]
+        targets = torch.linspace(self.x_min, self.x_max,
+                                 self.L, dtype=torch.float32, device=device)
+        targets = targets.repeat(T, 1)
+
+        # Scale table
+        scale_table = torch.tensor(SCALE_TABLE, dtype=torch.float32).to(device)
+
+        # Calc P = cdf_delta
+        inv_stdv = torch.exp(
+            -scale_table.unsqueeze(-1))  # <= exp(7), is exp(-sigma), inverse std. deviation, i.e., sigma'
+        plus_in = inv_stdv * (targets + self.bin_width / 2)  # modified
+        min_in = inv_stdv * (targets - self.bin_width / 2)  # modified
+
+        #
+        cdf_plus = self._standardized_cumulative(plus_in)
+        cdf_min = self._standardized_cumulative(min_in)
+
+        # the following two follow from the definition of the logistic distribution
+        log_cdf_plus = plus_in - F.softplus(plus_in)  # log probability for edge case of 0
+        log_one_minus_cdf_min = -F.softplus(min_in)  # log probability for edge case of 255
+        cdf_delta = cdf_plus - cdf_min  # probability for all other cases, essentially log_cdf_plus + log_one_minus_cdf_min
+
+        # NOTE:
+        out_A = torch.log(torch.clamp(cdf_delta, min=1e-12))
+        # NOTE, we adapt the bounds for our case
+        cond_B = (targets > self.x_upper_bound).float()
+        out_B = (cond_B * log_one_minus_cdf_min + (1. - cond_B) * out_A)
+        cond_C = (targets < self.x_lower_bound).float()
+        # =log(P^k(c))
+        log_probs = cond_C * log_cdf_plus + (1. - cond_C) * out_B
+
+        # final P of target list
+        pmf_table = log_probs.exp_()
+
+        # PMF to CDF
+        pmf_table = (pmf_table * (2 ** 16)).int()
+        cdf_table = torch.cumsum(torch.clamp(pmf_table, min=1), dim=1)  # [T,Lp]
+        self.cdf_table = F.pad(cdf_table, (1, 0, 0, 0), "constant", value=0)
+
+        self.built = True
+
+    def cdf(self, l, C):
+        """
+        :param l: predicted distribution, i.e., NKpHW, see above
+        :param C: number of channels
+        :return: CDF table, i.e., [T, Lp]
+        :return: CDF indice, i.e., [N,C,H,W]
+        """
+
+        if (not self.built):
+            self.build_table(l.device)
+
+        N, Kp, H, W = l.shape
+        K = non_shared_get_K(Kp, C, self._num_params)
+        assert K == 1
+
+        # we have, for each channel: K pi / K mu / K sigma / [K coeffs]
+        # note that this only holds for C=3 as for other channels, there would be more than 3*K coeffs
+        # but non_shared only holds for the C=3 case
+        l = l.reshape(N, self._num_params, C, K, H, W)
+
+        if (self._num_params > 2):
+            log_scales = torch.clamp(l[:, 2, :, 0, ...], min=_LOG_SCALES_MIN)  # NCHW, is >= -7
+        else:
+            log_scales = torch.clamp(l[:, 0, :, 0, ...], min=_LOG_SCALES_MIN)  # NCHW, is >= -7
+
+        ##### modified: select scale from SCALE_TABLE #####
+        scale_table = torch.tensor(SCALE_TABLE, dtype=torch.float32).to(l.device)
+        # Get indice of scale from table
+        indice = log_scales.unsqueeze(-1) > scale_table.repeat([N, C, H, W, 1])  # NCHWLp
+        indice = indice.sum(-1)  # NCHW, index, no need to +1
+        ####################
+
+        # final scale PMF table, TL
+        # features' indice for PMF table, NCHW
+        return self.cdf_table.cpu().numpy(), indice.cpu().numpy()
+
+    def _extract_non_shared(self, x, l):
+        """
+        :param x: targets, NCHW
+        :param l: output of net, NKpHW, see above
+        :return:
+            x NC1HW,
+            logit_probs NCKHW (probabilites of scales, i.e., \pi_k)
+            means NCKHW,
+            log_scales NCKHW (variances),
+            K (number of mixtures)
+        """
+        N, C, H, W = x.shape
+        Kp = l.shape[1]
+
+        K = non_shared_get_K(Kp, C, self._num_params)
+
+        # we have, for each channel: K pi / K mu / K sigma / [K coeffs]
+        # note that this only holds for C=3 as for other channels, there would be more than 3*K coeffs
+        # but non_shared only holds for the C=3 case
+        l = l.reshape(N, self._num_params, C, K, H, W)
+        # print(l.shape,K, Kp,"lshape1111111111111")
+
+        if K == 1:
+            if (self._num_params == 3 or self._num_params == 4):
+                logit_probs = l[:, 0, ...]  # NCKHW
+                means = l[:, 1, ...]  # NCKHW
+                log_scales = torch.clamp(l[:, 2, ...], min=_LOG_SCALES_MIN)  # NCKHW, is >= -7
+            elif (self._num_params == 2):
+                logit_probs = None
+                means = l[:, 1, ...]  # NCKHW
+                log_scales = torch.clamp(l[:, 0, ...], min=_LOG_SCALES_MIN)  # NCKHW, is >= -7
+            elif (self._num_params == 1):
+                logit_probs = None
+                means = None
+                log_scales = torch.clamp(l[:, 0, ...], min=_LOG_SCALES_MIN)  # NCKHW, is >= -7
+            x = x.reshape(N, C, 1, H, W)
+
+            if self.use_coeffs:
+                assert C == 3  # Coefficients only supported for C==3, see note where we define _NUM_PARAMS_RGB
+                coeffs = self._nonshared_coeffs_act(l[:, 3, ...])  # NCKHW, basically coeffs_g_r, coeffs_b_r, coeffs_b_g
+                means_r, means_g, means_b = means[:, 0, ...], means[:, 1, ...], means[:, 2, ...]  # each NKHW
+                coeffs_g_r, coeffs_b_r, coeffs_b_g = coeffs[:, 0, ...], coeffs[:, 1, ...], coeffs[:, 2,
+                                                                                           ...]  # each NKHW
+                means = torch.stack(
+                    (means_r,
+                     means_g + coeffs_g_r * x[:, 0, ...],
+                     means_b + coeffs_b_r * x[:, 0, ...] + coeffs_b_g * x[:, 1, ...]), dim=1)  # NCKHW again
+            assert means.shape == (N, C, K, H, W), (means.shape, (N, C, K, H, W))
+        else:
+            x = x.reshape(N, C, 1, H, W)
+            logit_probs = l[:, 0:3, ...]  # NCKHW
+            means = l[:, 3:2 * 3, ...]  # NCKHW
+            log_scales = torch.clamp(l[:, 2 * 3:3 * 3, ...], min=_LOG_SCALES_MIN)  # NCKHW, is >= -7
+
+        # print(l.shape, x.shape, logit_probs.shape,means.shape)
+        # assert means.shape == (N, C, K, H, W), (means.shape, (N, C, K, H, W))
+        return x, logit_probs, means, log_scales, K
+
+    def _standardized_cumulative(self, inputs):
+        """Evaluate the standardized cumulative density."""
+        raise NotImplementedError("Must inherit from SymmetricConditional.")
+
+    def _standardized_quantile(self, quantile):
+        """Evaluate the standardized quantile function."""
+        raise NotImplementedError("Must inherit from SymmetricConditional.")
+
+
+class DiscretizedMixGaussLoss(DiscretizedMixDistribution1):
+    """Conditional Gaussian entropy model."""
+
+    def _standardized_cumulative(self, inputs):
+        half = torch.tensor(.5)
+        const = torch.tensor(-(2 ** -0.5))
+        return 0.5 * torch.erfc(const * inputs)
+
+
+class Entropy(torch.nn.Module):
+    """Entropy Model with Hyperprior"""
+
+    def __init__(self, channel, bin_size=1):
+        super(Entropy, self).__init__()
+
+        self.bin_size = bin_size
+        self.mu = torch.nn.Parameter(torch.zeros((1, channel, 1, 1)), requires_grad=True)
+        self.log_sigma = torch.nn.Parameter(torch.zeros((1, channel, 1, 1)), requires_grad=True)
+
+    def forward(self, x):
+        # Input format: [N,C,H,W]
+
+        centered_x = x - self.mu
+        centered_x = centered_x.abs()  # modified
+        inv_stdv = torch.exp(-self.log_sigma)
+
+        plus_in = inv_stdv * (- centered_x + self.bin_size / 2)  # sigma' * (x - mu + 0.5)  # modified
+        min_in = inv_stdv * (- centered_x - self.bin_size / 2)
+
+        cdf_plus = self.gauss_standardized_cumulative(plus_in)  # S(sigma' * (x - mu + 1/255))
+        cdf_min = self.gauss_standardized_cumulative(min_in)
+        probs = cdf_plus - cdf_min
+
+        probs = torch.clamp(probs, min=1e-12)
+
+        return probs
+
+    def gauss_standardized_cumulative(self, inputs):
+        half = torch.tensor(.5)
+        const = torch.tensor(-(2 ** -0.5))
+        return 0.5 * torch.erfc(const * inputs)
+
+class analysisTransformModel_y(nn.Module, ABC):
+    def __init__(self, N):
+        super(analysisTransformModel_y, self).__init__()
+        self.conv1 = nn.Conv2d(3, N, 5, stride=2, padding=2)
+        self.conv2 = nn.Conv2d(N, N, 5, stride=2, padding=2)
+        self.conv3 = nn.Conv2d(N, N, 5, stride=2, padding=2)
+        self.conv4 = nn.Conv2d(N, N, 5, stride=2, padding=2)
+        self.r1 = ResidualBlock(N, N)
+        self.r2 = ResidualBlock(N, N)
+        self.r3 = ResidualBlock(N, N)
+
+    def forward(self, inputs):
+        x = self.r1(self.conv1(inputs))
+        x = self.r2(self.conv2(x))
+        # x = self.att1(x)
+        x = self.r3(self.conv3(x))
+        x = self.conv4(x)
+        # x = self.att2(x)
+        return x
+
+
+class synthesisTransformModel_y(nn.Module, ABC):
+    def __init__(self, N):
+        super(synthesisTransformModel_y, self).__init__()
+
+        self.deconv1 = nn.ConvTranspose2d(N, N, 5, stride=2, padding=2, output_padding=1)
+        self.deconv2 = nn.ConvTranspose2d(N, N, 5, stride=2, padding=2, output_padding=1)
+        self.deconv3 = nn.ConvTranspose2d(N, N, 5, stride=2, padding=2, output_padding=1)
+        self.deconv4 = nn.ConvTranspose2d(N, 3, 5, stride=2, padding=2, output_padding=1)
+
+        self.r1 = ResidualBlock(N, N)
+        self.r2 = ResidualBlock(N, N)
+        self.r3 = ResidualBlock(N, N)
+
+    def forward(self, inputs):
+        # x = self.att1(inputs)
+        x = self.r1(self.deconv1(inputs))
+        x = self.r2(self.deconv2(x))
+        # x = self.att2(x)
+        x = self.r3(self.deconv3(x))
+        x = self.deconv4(x)
+        return x
+
+
+class priorEncoder_y(nn.Module, ABC):
+    def __init__(self, out_channel_N):
+        super(priorEncoder_y, self).__init__()
+        self.co1 = nn.Conv2d(out_channel_N, out_channel_N, 3, 1, 1)
+        self.co2 = nn.Conv2d(out_channel_N, out_channel_N, 3, 2, 1)
+        self.co3 = nn.Conv2d(out_channel_N, out_channel_N, 3, 1, 1)
+        self.co4 = nn.Conv2d(out_channel_N, out_channel_N, 3, 1, 1)
+
+        self.relu1 = nn.LeakyReLU(inplace=True)
+        self.relu2 = nn.LeakyReLU(inplace=True)
+        self.relu3 = nn.LeakyReLU(inplace=True)
+        # self.att = CoTAttention(out_channel_N)
+
+    def forward(self, inputs):
+        x = self.relu1(self.co1(inputs))
+        x = self.relu2(self.co2(x))
+        x = self.relu3(self.co3(x))
+        x = self.co4(x)
+        # x = self.att(x)
+        return x
+
+
+class priorDecoder_y(nn.Module, ABC):
+    def __init__(self, out_channel_N):
+        super(priorDecoder_y, self).__init__()
+        self.conv1 = nn.ConvTranspose2d(out_channel_N, out_channel_N, 3, 1, 1)
+        self.conv2 = nn.ConvTranspose2d(out_channel_N, out_channel_N, 3, 1, 1)
+        self.conv3 = nn.ConvTranspose2d(out_channel_N, out_channel_N, 3, 2, 1, 1)
+        self.conv4 = nn.ConvTranspose2d(out_channel_N, out_channel_N, 3, 1, 1)
+
+        self.relu1 = nn.LeakyReLU(inplace=True)
+        self.relu2 = nn.LeakyReLU(inplace=True)
+        self.relu3 = nn.LeakyReLU(inplace=True)
+        # self.att = CoTAttention(out_channel_N)
+
+    def forward(self, inputs):
+        # x = self.att(inputs)
+        x = self.relu1(self.conv1(inputs))
+        x = self.relu2(self.conv2(x))
+        x = self.relu3(self.conv3(x))
+        x = self.conv4(x)
+        return x
+
+
+class Low_bound(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        x = torch.clamp(x, min=1e-6)
+        return x
+
+    @staticmethod
+    def backward(ctx, g):
+        x, = ctx.saved_tensors
+        grad1 = g.clone()
+        grad1[x < 1e-6] = 0
+        pass_through_if = np.logical_or(
+            x.cpu().numpy() >= 1e-6, g.cpu().numpy() < 0.0)
+        t = torch.Tensor(pass_through_if + 0.0).cuda()
+
+        return grad1 * t
+
+class MaskConv2d(nn.Module, ABC):
+    def __init__(self, in_channel, out_channel, kernel_size=5, stride=1, mask_type=None):
+        super(MaskConv2d, self).__init__()
+        pad = (kernel_size // 2, kernel_size // 2, kernel_size // 2, 0)
+        self.padding = nn.ZeroPad2d(pad)
+        kernel_shape = (kernel_size // 2 + 1, kernel_size)
+        self.conv = nn.Conv2d(in_channel, out_channel, kernel_shape, stride, padding=0, bias=True)
+
+        def get_mask(k, mask_type='first'):
+            c = 0 if mask_type == 'first' else 1
+            mask = np.ones((k // 2 + 1, k), dtype=np.float32)
+            mask[k // 2, k // 2 + c:] = 0
+            mask[k // 2 + 1:, :] = 0
+            mask = torch.from_numpy(mask).unsqueeze(0)
+            return mask
+
+        self.mask = (get_mask(kernel_size, mask_type))
+
+    def forward(self, x):
+        # print(self.mask.size())
+        x = self.padding(x)
+        self.conv.weight.data = self.conv.weight.data * self.mask.to(self.conv.weight.data.device)
+        x = self.conv(x.to(self.conv.weight.data.device))
+
+        return x
+
+class context_extra(nn.Module, ABC):
+    def __init__(self, ch_in=1, ch_out=2, kernal=5):
+        super(context_extra, self).__init__()
+        if kernal == 1:
+            self.mask_conv1 = MaskConv2d(in_channel=ch_in, out_channel=ch_out, kernel_size=3, mask_type='first')
+            self.mask_conv2 = MaskConv2d(in_channel=ch_in, out_channel=ch_out, kernel_size=5, mask_type='first')
+            self.mask_conv3 = MaskConv2d(in_channel=ch_in, out_channel=ch_out, kernel_size=7, mask_type='first')
+            self.mask_conv4 = MaskConv2d(in_channel=ch_in, out_channel=ch_out, kernel_size=9, mask_type='first')
+            self.conv = nn.Conv2d(ch_out*4, ch_out, 1, 1)
+        else:
+            self.mask_conv0 = MaskConv2d(in_channel=ch_in, out_channel=ch_out, kernel_size=kernal, mask_type='first')
+        self.kernal = kernal
+
+    def forward(self, y):
+        if self.kernal == 1:
+            x1 = self.mask_conv1(y)
+            x2 = self.mask_conv2(y)
+            x3 = self.mask_conv3(y)
+            x4 = self.mask_conv4(y)
+            x = torch.cat((x1, x2, x3, x4), 1)
+        else:
+            x = self.mask_conv0(y)
+
+        return x
+
+
+class parameter_estimation(nn.Module, ABC):
+    def __init__(self, input_ch=1, output_ch=1):
+        super(parameter_estimation, self).__init__()
+        self.c0 = nn.Sequential(
+           nn.Conv2d(input_ch, 1152, 1, 1),
+           nn.LeakyReLU(0.2, inplace=True),
+           nn.Conv2d(1152, 1152, 1, 1),
+           nn.LeakyReLU(0.2, inplace=True),
+           nn.Conv2d(1152, output_ch, 1, 1)
+        )
+
+    def forward(self, y):
+        return self.c0(y)
+
+class global_context_extration(nn.Module, ABC):
+    def __init__(self, input_ch=1, output_ch=1, kg=3):
+        super(global_context_extration, self).__init__()
+        if kg == 3:
+            self.c0 = nn.Sequential(
+                   nn.Conv2d(input_ch, output_ch, 3, 1, 1),
+            )
+        elif kg == 5:
+            self.c0 = nn.Sequential(
+                nn.Conv2d(input_ch, output_ch, 5, 1, 2),
+            )
+        elif kg == 7:
+            self.c0 = nn.Sequential(
+                nn.Conv2d(input_ch, output_ch, 7, 1, 3),
+            )
+        elif kg == 9:
+            self.c0 = nn.Sequential(
+                nn.Conv2d(input_ch, output_ch, 9, 1, 4),
+            )
+
+    def forward(self, y):
+
+        x = self.c0(y)
+        return x
+
+
+class Distribution_for_single(nn.Module, ABC):
+    def __init__(self, model):
+        super(Distribution_for_single, self).__init__()
+        self.model = model
+
+    def forward(self, x, p_dec):
+        mean, scale = [torch.chunk(p_dec, 2, dim=1)[i].squeeze(1) for i in range(2)]
+        # keep the weight  summation of prob == 1
+        # probs = torch.stack([prob0, prob1, prob2], dim=-1)
+        # probs = F.softmax(probs, dim=-1)
+        # process the scale value to non-zero
+        scale[scale <= 0] = 1e-6
+        # print(mean.max(), mean.min(), scale.max())
+        # 3 gaussian distribution
+        if self.model == 1:
+            m = torch.distributions.normal.Normal(mean, scale)
+        elif self.model == 2:
+            m = torch.distributions.laplace.Laplace(mean, scale)
+        elif self.model == 3:
+            m = torch.distributions.cauchy.Cauchy(mean, scale)
+        elif self.model == 4:
+            m = torch.distributions.gumbel.Gumbel(mean, scale)
+        elif self.model == 5:
+            m = torch.distributions.logistic_normal.LogisticNormal(mean, scale)
+        # print("mean:", mean.max(), mean.min(), 'scale:',scale.max(), scale.min(),'x', x.min(), x.max())
+        # int("scale_mean",scale.max().item(), scale.min().item(), mean.max().item(), mean.min().item())
+        # likelihood = torch.abs(m.cdf(x + 0.5) - m.cdf(x - 0.5))
+        # print('likelihood:',torch.sum(likelihood))
+        likelihood = Low_bound.apply(torch.abs(m.cdf(x + 0.5) - m.cdf(x - 0.5)))
+        # print(likelihood.max(), likelihood.min())
+        return - torch.sum(torch.log(likelihood) / np.log(2)), torch.log(likelihood)/(-np.log(2))
+
+
+class Distribution_for_GMM(nn.Module, ABC):
+    def __init__(self, k=3, t=1):
+
+        ###
+        super(Distribution_for_GMM, self).__init__()
+        self.k = k
+        self.t = t
+
+    def forward(self, x, p_dec):
+        mean_error = 0
+        if self.k == 3:
+            prob0, mean0, scale0, prob1, mean1, scale1, prob2, mean2, scale2 = [
+                torch.chunk(p_dec, 9, dim=1)[i].squeeze(1) for i in range(9)]
+            # keep the weight  summation of prob == 1
+            # print(11111,p_dec.size())
+            # print(prob1.size(), prob2.size(), prob0.size())
+
+            probs = torch.stack([prob0, prob1, prob2], dim=-1)
+            probs = 0.1+0.9*F.softmax(probs, dim=-1)
+            # process the scale value to non-zero
+            # scale0[scale0 == 0] = 1e-6
+            # scale1[scale1 == 0] = 1e-6
+            # scale2[scale2 == 0] = 1e-6
+            scale0 = Low_bound.apply(scale0)
+            scale1 = Low_bound.apply(scale1)
+            scale2 = Low_bound.apply(scale2)
+            # print(self.t, scale0.size(), probs.size())
+
+            # 3 gaussian distribution
+            m0 = torch.distributions.normal.Normal(mean0, scale0)
+            m1 = torch.distributions.normal.Normal(mean1, scale1)
+            m2 = torch.distributions.normal.Normal(mean2, scale2)
+
+
+
+            if self.t == 1:
+                likelihoods = Low_bound.apply(
+                    probs[:, :, :, :, 0] * torch.abs(m0.cdf(x + 0.5) - m0.cdf(x - 0.5))
+                    + probs[:, :, :, :, 1] * torch.abs(m1.cdf(x + 0.5) - m1.cdf(x - 0.5))
+                    + probs[:, :, :, :, 2] * torch.abs(m2.cdf(x + 0.5) - m2.cdf(x - 0.5)))
+                # print(111, probs[0, 0, 0, 0, 0], probs[0, 0, 0, 0, 1],probs[0, 0, 0, 0, 2], )
+            else:
+                likelihoods = Low_bound.apply(
+                    probs[:, :, :, 0] * torch.abs(m0.cdf(x + 0.5) - m0.cdf(x - 0.5))
+                    + probs[:, :, :, 1] * torch.abs(m1.cdf(x + 0.5) - m1.cdf(x - 0.5))
+                    + probs[:, :, :, 2] * torch.abs(m2.cdf(x + 0.5) - m2.cdf(x - 0.5)))
+                # print(22222, probs[0, 0, 0, 0], probs[0, 0, 0, 1],probs[0, 0, 0, 2], )
+        elif self.k == 4:
+            prob0, mean0, scale0, prob1, mean1, scale1, prob2, mean2, scale2, prob3, mean3, scale3 = [
+                torch.chunk(p_dec, 12, dim=1)[i].squeeze(1) for i in range(12)]
+
+            probs = torch.stack([prob0, prob1, prob2, prob3], dim=-1)
+            probs = F.softmax(probs, dim=-1)
+            # process the scale value to non-zero
+            scale0[scale0 == 0] = 1e-6
+            scale1[scale1 == 0] = 1e-6
+            scale2[scale2 == 0] = 1e-6
+            scale3[scale3 == 0] = 1e-6
+            # 3 gaussian distribution
+            m0 = torch.distributions.normal.Normal(mean0, scale0)
+            m1 = torch.distributions.normal.Normal(mean1, scale1)
+            m2 = torch.distributions.normal.Normal(mean2, scale2)
+            m3 = torch.distributions.normal.Normal(mean3, scale3)
+
+            if self.t == 1:
+                likelihoods = Low_bound.apply(
+                    probs[:, :, :, :, 0] * torch.abs(m0.cdf(x + 0.5) - m0.cdf(x - 0.5))
+                    + probs[:, :, :, :, 1] * torch.abs(m1.cdf(x + 0.5) - m1.cdf(x - 0.5))
+                    + probs[:, :, :, :, 2] * torch.abs(m2.cdf(x + 0.5) - m2.cdf(x - 0.5))
+                    + probs[:, :, :, :, 3] * torch.abs(m3.cdf(x + 0.5) - m3.cdf(x - 0.5)))
+            else:
+                likelihoods = Low_bound.apply(
+                    probs[:, :, :, 0] * torch.abs(m0.cdf(x + 0.5) - m0.cdf(x - 0.5))
+                    + probs[:, :, :, 1] * torch.abs(m1.cdf(x + 0.5) - m1.cdf(x - 0.5))
+                    + probs[:, :, :, 2] * torch.abs(m2.cdf(x + 0.5) - m2.cdf(x - 0.5))
+                    + probs[:, :, :, 3] * torch.abs(m3.cdf(x + 0.5) - m3.cdf(x - 0.5)))
+        elif self.k == 5:
+            prob0, mean0, scale0, prob1, mean1, scale1, prob2, mean2, scale2, \
+            prob3, mean3, scale3, prob4, mean4, scale4 = \
+                [torch.chunk(p_dec, 15, dim=1)[i].squeeze(1) for i in range(15)]
+
+
+            probs = torch.stack([prob0, prob1, prob2, prob3, prob4], dim=-1)
+
+            probs = F.softmax(probs, dim=-1)
+
+            scale0[scale0 == 0] = 1e-6
+            scale1[scale1 == 0] = 1e-6
+            scale2[scale2 == 0] = 1e-6
+            scale3[scale3 == 0] = 1e-6
+            scale4[scale4 == 0] = 1e-6
+
+            m0 = torch.distributions.normal.Normal(mean0, scale0)
+            m1 = torch.distributions.normal.Normal(mean1, scale1)
+            m2 = torch.distributions.normal.Normal(mean2, scale2)
+            m3 = torch.distributions.normal.Normal(mean3, scale3)
+            m4 = torch.distributions.normal.Normal(mean4, scale4)
+
+            if self.t == 1:
+                likelihoods = Low_bound.apply(
+                    probs[:, :, :, :, 0] * torch.abs(m0.cdf(x + 0.5) - m0.cdf(x - 0.5))
+                    + probs[:, :, :, :, 1] * torch.abs(m1.cdf(x + 0.5) - m1.cdf(x - 0.5))
+                    + probs[:, :, :, :, 2] * torch.abs(m2.cdf(x + 0.5) - m2.cdf(x - 0.5))
+                    + probs[:, :, :, :, 3] * torch.abs(m3.cdf(x + 0.5) - m3.cdf(x - 0.5))
+                    + probs[:, :, :, :, 4] * torch.abs(m4.cdf(x + 0.5) - m4.cdf(x - 0.5)))
+                mean_error = 0
+            else:
+                likelihoods = Low_bound.apply(
+                    probs[:, :, :, 0] * torch.abs(m0.cdf(x + 0.5) - m0.cdf(x - 0.5))
+                    + probs[:, :, :, 1] * torch.abs(m1.cdf(x + 0.5) - m1.cdf(x - 0.5))
+                    + probs[:, :, :, 2] * torch.abs(m2.cdf(x + 0.5) - m2.cdf(x - 0.5))
+                    + probs[:, :, :, 3] * torch.abs(m3.cdf(x + 0.5) - m3.cdf(x - 0.5))
+                    + probs[:, :, :, 4] * torch.abs(m4.cdf(x + 0.5) - m4.cdf(x - 0.5)))
+
+        return torch.sum(torch.log(likelihoods) / (-np.log(2))), torch.log(likelihoods)/(-np.log(2))
+
+
+class NoiseQuant(nn.Module):
+    def __init__(self, table_range=128, bin_size=1.0):
+        super(NoiseQuant, self).__init__()
+        self.table_range = table_range
+        half_bin = torch.tensor(bin_size / 2).to(torch.device("cuda"))
+        self.noise = uniform.Uniform(-half_bin, half_bin)
+
+    def forward(self, x):
+        if self.training:
+            x_quant = x + self.noise.sample(x.shape)
+        else:
+            x_quant = torch.floor(x + 0.5)  # modified
+        return torch.clamp(x_quant, -self.table_range, self.table_range - 1)
+
+
+class Image_compression(nn.Module, ABC):
+    def __init__(self, N, gmm=1, kernal=3, model=1, context_ch=32, att=0,kg=3, im_context=1):
+        super(Image_compression, self).__init__()
+        self.im_context = im_context
+        self.gmm = gmm
+        self.kernal = kernal
+        self.encoder_y = analysisTransformModel_y(N)
+        self.priorE_y = priorEncoder_y(N)
+        self.decoder_y = synthesisTransformModel_y(N)
+        self.priorD_y = priorDecoder_y(N)
+
+        self.factorized_entropy_func_y_temp = Entropy(N)
+        self.factorized_entropy_func_y = Entropy(N)
+
+
+        # no self context information
+        self.rgb2yuv = RGB2YCbCr()
+        self.yuv2rgb = YCbCr2RGB()
+        self.quant = NoiseQuant(table_range=128)
+
+        if kernal == 0:
+            self.global_comtest_Y = global_context_extration(3, context_ch, kg)
+            self.global_comtest_U = global_context_extration(4, context_ch, kg)
+            self.global_comtest_V = global_context_extration(5, context_ch, kg)
+            self.global_comtest_img = global_context_extration(N, N, att)
+            if gmm == 1:
+                self.estimate_Y = parameter_estimation(context_ch, 2)
+                self.estimate_U = parameter_estimation(context_ch, 2)
+                self.estimate_V = parameter_estimation(context_ch, 2)
+                self.estimate_img = parameter_estimation(N, N*2)
+            else:
+                self.estimate_Y = parameter_estimation(context_ch, gmm * 3)
+                self.estimate_U = parameter_estimation(context_ch, gmm * 3)
+                self.estimate_V = parameter_estimation(context_ch, gmm * 3)
+                self.estimate_img = parameter_estimation(N, gmm * 3 * N)
+        # mixture context information
+        elif kernal == 1:
+            self.context_extra_Y = context_extra(ch_in=1, ch_out=context_ch, kernal=kernal)
+            self.context_extra_U = context_extra(ch_in=1, ch_out=context_ch, kernal=kernal)
+            self.context_extra_V = context_extra(ch_in=1, ch_out=context_ch, kernal=kernal)
+
+            if im_context == 1:
+                self.context_extra_img = context_extra(ch_in=N, ch_out=context_ch, kernal=kernal)
+                self.global_comtest_Y = global_context_extration(3, context_ch, kg)
+                self.global_comtest_U = global_context_extration(4, context_ch, kg)
+                self.global_comtest_V = global_context_extration(5, context_ch, kg)
+                self.global_comtest_img = global_context_extration(N, N, att, kg)
+                if gmm == 1:
+                    self.estimate_Y = parameter_estimation(context_ch*5, 2)
+                    self.estimate_U = parameter_estimation(context_ch*5, 2)
+                    self.estimate_V = parameter_estimation(context_ch*5, 2)
+                    self.estimate_img = parameter_estimation(context_ch*4+N, 2*N)
+                else:
+                    self.estimate_Y = parameter_estimation(context_ch * 5, gmm*3)
+                    self.estimate_U = parameter_estimation(context_ch * 5, gmm*3)
+                    self.estimate_V = parameter_estimation(context_ch * 5, gmm*3)
+                    self.estimate_img = parameter_estimation(context_ch * 4 + N, gmm*3 * N)
+            else:
+
+                self.global_comtest_U = global_context_extration(1, context_ch, kg)
+                self.global_comtest_V = global_context_extration(2, context_ch, kg)
+                if gmm == 1:
+                    self.estimate_Y = parameter_estimation(context_ch * 4, 2)
+                    self.estimate_U = parameter_estimation(context_ch * 5, 2)
+                    self.estimate_V = parameter_estimation(context_ch * 5, 2)
+                else:
+                    self.estimate_Y = parameter_estimation(context_ch * 4, gmm * 3)
+                    self.estimate_U = parameter_estimation(context_ch * 5, gmm * 3)
+                    self.estimate_V = parameter_estimation(context_ch * 5, gmm * 3)
+        else:
+            self.context_extra_Y = context_extra(ch_in=1, ch_out=context_ch, kernal=kernal)
+            self.context_extra_U = context_extra(ch_in=1, ch_out=context_ch, kernal=kernal)
+            self.context_extra_V = context_extra(ch_in=1, ch_out=context_ch, kernal=kernal)
+
+            if im_context == 1:
+                self.context_extra_img = context_extra(ch_in=N, ch_out=context_ch, kernal=kernal)
+                self.global_comtest_Y = global_context_extration(3, context_ch, kg)
+                self.global_comtest_U = global_context_extration(4, context_ch, kg)
+                self.global_comtest_V = global_context_extration(5, context_ch, kg)
+                self.global_comtest_img = global_context_extration(N, context_ch, kg)
+            else:
+                self.global_comtest_U = global_context_extration(1, context_ch, kg)
+                self.global_comtest_V = global_context_extration(2, context_ch, kg)
+            if gmm == 1:
+                if im_context == 1:
+                    self.estimate_Y = parameter_estimation(context_ch * 2, 2)
+                    self.estimate_img = parameter_estimation(context_ch * 2, 2 * N)
+                else:
+                    self.estimate_Y = parameter_estimation(context_ch, 2)
+
+                self.estimate_U = parameter_estimation(context_ch * 2, 2)
+                self.estimate_V = parameter_estimation(context_ch * 2, 2)
+
+            else:
+                if im_context==1:
+                    self.estimate_U = parameter_estimation(context_ch * 2, gmm * 3)
+                    self.estimate_V = parameter_estimation(context_ch * 2, gmm * 3)
+                    self.estimate_img = parameter_estimation(context_ch * 2, gmm * 3 * N)
+                    self.estimate_Y = parameter_estimation(context_ch * 2, gmm * 3)
+                else:
+                    self.estimate_U = parameter_estimation(context_ch * 2, gmm * 3)
+                    self.estimate_V = parameter_estimation(context_ch * 2, gmm * 3)
+                    self.estimate_Y = parameter_estimation(context_ch, gmm * 3)
+
+        if gmm == 1:
+            if im_context ==1:
+                self.context_model_img = Distribution_for_single(model)
+            self.context_model_Y = Distribution_for_single(model)
+            self.context_model_U = Distribution_for_single(model)
+            self.context_model_V = Distribution_for_single(model)
+
+        else:
+            self.context_model_Y = DiscretizedMixGaussLoss(rgb_scale=False, x_min=-128, x_max=128 - 1,
+                                              num_p=3, L=128 * 2)
+            self.context_model_U = DiscretizedMixGaussLoss(rgb_scale=False, x_min=-256, x_max=256 - 1,
+                                              num_p=3, L=256 * 2)
+            self.context_model_V = DiscretizedMixGaussLoss(rgb_scale=False, x_min=-256, x_max=256 - 1,
+                                              num_p=3, L=256 * 2)
+            if im_context==1:
+                self.context_model_img = DiscretizedMixGaussLoss(rgb_scale=False, x_min=-128, x_max=128 - 1,
+                                              num_p=3, L=128 * 2)
+
+
+        for m in self.modules():
+            for name, parameter in m.named_parameters():
+                if parameter.dim() > 1:
+                    nn.init.xavier_uniform_(parameter)
+                elif parameter.dim() == 1:
+                    if name.split('.')[-1] == 'weight':
+                        nn.init.normal_(parameter, mean=0, std=0.2)
+                    elif name.split('.')[-1] == 'bias':
+                        nn.init.constant_(parameter, 0.1)
+            break
+
+    def add_noise(self, x):
+        noise = np.random.uniform(-0.5, 0.5, x.size())
+        noise = torch.Tensor(noise).cuda()
+        return x + noise
+
+    def forward(self, inputs, stage=1, yuv_transform=1):
+        n, c, w, h = inputs.size()
+        if self.im_context==1:
+            y_latent = self.encoder_y(inputs)
+
+            y_latent_quantized = self.quant(y_latent)
+            y_hyper = self.priorE_y(y_latent)
+            y_hyper_likelihood = self.factorized_entropy_func_y(y_hyper)
+            y_hyper_quantized = self.quant(y_hyper)
+            if stage == 0:
+               y_hyper_quantized = torch.round(y_hyper)
+
+            y_prior = self.priorD_y(y_hyper_quantized)
+            del y_hyper_quantized, y_latent
+            # print(y_prior.size())
+            if self.kernal == 0:
+                y_prior = self.global_comtest_img(y_prior)
+                im_param = self.estimate_img(y_prior)
+                del y_prior
+            else:
+                y_prior = self.global_comtest_img(y_prior)
+                y_context = self.context_extra_img(y_latent_quantized)
+                im_param = self.estimate_img(torch.cat((y_prior, y_context), 1))
+                del y_context, y_prior
+            # y_likelihood, _= self.context_model_img(y_latent_quantized, im_param) # N, 384, 2, 2
+            y_likelihood = self.context_model_img(y_latent_quantized, im_param) # N, 384, 2, 2
+
+            del im_param, y_hyper
+            if self.training:
+                y_likelihood1 = y_likelihood.sum()
+                y_likelihood = y_likelihood1 / np.log(2)
+
+            else:
+                y_likelihood1 = (- y_likelihood).exp_()
+                y_likelihood = (- torch.log2(y_likelihood1).sum().item())
+
+            bpp_im = - torch.log2(y_hyper_likelihood + 1e-10).sum().item() /n / w / h / c + y_likelihood / n / w / h / c
+            rec_img = self.decoder_y(y_latent_quantized)
+
+            del y_latent_quantized, y_hyper_likelihood, y_likelihood
+            mse = torch.mean((rec_img - inputs).pow(2))
+        else:
+            bpp_im = 0
+            mse = 0
+
+        if yuv_transform == 1:
+            inputs_yuv_8 = self.rgb2yuv(torch.round(inputs * 255-128))
+        else:
+            inputs_yuv_8 = torch.round(inputs * 255-128)
+
+
+
+        Y = inputs_yuv_8[:, 0, :, :].unsqueeze(1).cuda()
+        U = inputs_yuv_8[:, 1, :, :].unsqueeze(1).cuda()
+        V = inputs_yuv_8[:, 2, :, :].unsqueeze(1).cuda()
+
+        # print(Y.max(),Y.min(),U.max(),U.min(),V.max(),V.min())
+
+        if self.kernal == 0:
+            Y_prior = self.global_comtest_Y(rec_img)
+            Y_param = self.estimate_Y(Y_prior)
+            del Y_prior
+        else:
+            if self.im_context==1:
+                Y_prior = self.global_comtest_Y(rec_img)
+                Y_context = self.context_extra_Y(Y)
+                Y_param = self.estimate_Y(torch.cat((Y_prior, Y_context), 1))
+                del Y_prior, Y_context
+            else:
+                Y_context = self.context_extra_Y(Y)
+                Y_param = self.estimate_Y(Y_context)
+                del Y_context
+
+
+        # Y_likelihood, Y_map = self.context_model_Y(Y, Y_param)
+        Y_likelihood = self.context_model_Y(Y, Y_param)
+        if self.training:
+            y_likelihood1 = Y_likelihood.sum()
+            bpp_y = y_likelihood1 / np.log(2) / w / n / h / c
+
+        else:
+            y_likelihood1 = (- Y_likelihood).exp_()
+            bpp_y = (- torch.log2(y_likelihood1).sum().item())/ w / n / h / c
+        # bpp_y = Y_likelihood / n / w / h / c
+        del Y_param, Y_likelihood
+
+        if self.kernal == 0:
+            U_prior = self.global_comtest_U(torch.cat((Y, rec_img), 1))
+            U_param = self.estimate_U(U_prior)
+            del U_prior
+        else:
+            if self.im_context==1:
+                U_prior = self.global_comtest_U(torch.cat((Y, rec_img), 1))
+                U_context = self.context_extra_U(U)
+                U_param = self.estimate_U(torch.cat((U_prior, U_context), 1))
+                del U_prior, U_context
+            else:
+                U_prior = self.global_comtest_U(Y)
+                U_context = self.context_extra_U(U)
+                U_param = self.estimate_U(torch.cat((U_prior, U_context), 1))
+                del U_prior, U_context
+
+        # U_likelihood, U_map = self.context_model_U(U, U_param)
+        U_likelihood = self.context_model_U(U, U_param)
+
+        if self.training:
+            y_likelihood1 = U_likelihood.sum()
+            bpp_u = y_likelihood1 / np.log(2) / w / n / h / c
+
+        else:
+            y_likelihood1 = (- U_likelihood).exp_()
+            bpp_u = (- torch.log2(y_likelihood1).sum().item())/ w / n / h / c
+        # bpp_u = U_likelihood / n / w / h / c
+        del U_param, U_likelihood
+        # print(Y.max(), Y.min(), U.max(), U.min(), V.max(), V.min())
+        if self.kernal == 0:
+            V_prior = self.global_comtest_V(torch.cat((Y, U, rec_img), 1))
+            V_param = self.estimate_V(V_prior)
+            del rec_img, V_prior, Y, U
+        else:
+            if self.im_context == 1:
+                V_prior = self.global_comtest_V(torch.cat((Y, U, rec_img), 1))
+            else:
+                V_prior = self.global_comtest_V(torch.cat((Y, U), 1))
+
+            V_context = self.context_extra_V(V)
+            V_param = self.estimate_V(torch.cat((V_prior, V_context), 1))
+            if self.im_context == 1:
+                del V_prior, V_context, Y, U, rec_img
+            else:
+                del V_prior, V_context, Y, U
+
+        # V_likelihood, V_map = self.context_model_V(V, V_param)
+
+        V_likelihood = self.context_model_V(V, V_param)
+        if self.training:
+            y_likelihood1 = V_likelihood.sum()
+            bpp_v = y_likelihood1 / np.log(2) / w / n / h / c
+
+        else:
+            y_likelihood1 = (- V_likelihood).exp_()
+            bpp_v = (- torch.log2(y_likelihood1).sum().item())/ w / n / h / c
+        # bpp_v = V_likelihood / n / w / h / c
+
+        return bpp_im, bpp_y, bpp_u, bpp_v, mse
+
